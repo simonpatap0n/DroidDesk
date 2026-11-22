@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """GNOME control panel for Android phones using ADB and scrcpy."""
 
+import base64
+import json
 import posixpath
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
 
 import gi
+from droidlink_bridge import PORT, DroidLinkBridge
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
 
 APP_ID = "io.github.example.DroidDesk"
@@ -27,6 +33,7 @@ ADB_CANDIDATES = (
 )
 SCRCPY_CANDIDATES = (Path("/usr/bin/scrcpy"), Path("/usr/local/bin/scrcpy"))
 BLUEZ = "org.bluez"
+HFP_AUDIO_GATEWAY_UUID = "0000111f-0000-1000-8000-00805f9b34fb"
 OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
 BLUEZ_AGENT_PATH = "/" + APP_ID.replace(".", "/") + "/Agent"
@@ -301,6 +308,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.contacts = []
         self.recents = []
         self.app_packages = []
+        self.app_icons = {}
+        self.app_labels = {}
         self.app_search_text = ""
         self.phone_profile_loading = set()
         self.scrcpy_processes = {}
@@ -310,9 +319,30 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.selected_adapter = None
         self.adapter_paths = []
         self._updating_bluetooth_controls = False
+        self.droidlink_pinned, self.droidlink_messages = self._load_droidlink_pins()
+        self.sms_notifications = []
+        self.droidlink_call_state = {"state": "IDLE", "audioRoute": "none", "muted": False}
+        self.incoming_call_dialog = None
+        self._updating_call_audio_controls = False
+        self.photo_preview_dir = None
+        self.photo_preview_window = None
+        self.external_photo_dirs = []
+        self.gallery_photos = []
+        self.gallery_cards = {}
+        self.gallery_requested_thumbnails = set()
+        self.gallery_selected = None
         self.busy = False
         self._build_ui()
         self.bluez = BlueZClient(self.update_bluetooth_view, self._set_status, self._agent_prompt)
+        try:
+            self.droidlink_bridge = DroidLinkBridge(
+                on_change=self._droidlink_state_changed,
+                on_event=self._droidlink_received,
+            )
+        except OSError as error:
+            self.droidlink_bridge = None
+            self._set_status(f"DroidLink indisponible : {error}", True)
+        self.droidlink_timer = GLib.timeout_add_seconds(1, self._droidlink_timer_tick)
         self.connect("close-request", self._on_close)
         self._update_controls()
         self.refresh_devices()
@@ -397,6 +427,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.bluetooth_page = self._build_bluetooth_page()
         self.adb_page = self._build_adb_page()
         self.info_page = self._build_info_page()
+        self.droidlink_page = self._build_droidlink_page()
         self._add_stack_page(self.calls_page, "calls", "Appels")
         self._add_stack_page(self.contacts_page, "contacts", "Contacts")
         self._add_stack_page(self.recents_page, "recents", "Récents")
@@ -406,7 +437,66 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self._add_stack_page(self.bluetooth_page, "bluetooth", "Bluetooth")
         self._add_stack_page(self.adb_page, "adb", "ADB")
         self._add_stack_page(self.info_page, "info", "Appareil")
+        self._add_stack_page(self.droidlink_page, "droidlink", "DroidLink")
         self.stack.connect("notify::visible-child-name", self._on_page_changed)
+
+    def _build_droidlink_page(self):
+        page = self._page()
+        page.append(self._heading(
+            "DroidLink",
+            "Le compagnon Android envoie les notifications dans GNOME et relie les appels, les photos et les icônes au bureau.",
+        ))
+
+        pairing = Adw.PreferencesGroup.new()
+        pairing.set_title("Téléphone compagnon")
+        pairing.set_description("Le code est à usage unique et expire après deux minutes.")
+        self.droidlink_status = Gtk.Label(label="Aucun téléphone DroidLink associé.", xalign=0)
+        self.droidlink_status.set_wrap(True)
+        self.droidlink_status.add_css_class("dim-label")
+        status_row = Adw.ActionRow.new()
+        status_row.set_title("État")
+        status_row.add_suffix(self.droidlink_status)
+        pairing.add(status_row)
+
+        self.droidlink_code_label = Gtk.Label(label="—")
+        self.droidlink_code_label.add_css_class("title-1")
+        self.droidlink_code_label.add_css_class("monospace")
+        self.droidlink_code_label.set_selectable(True)
+        code_row = Adw.ActionRow.new()
+        code_row.set_title("Code d’association")
+        code_row.set_subtitle("Saisis-le dans l’application DroidLink sur Android.")
+        code_row.add_suffix(self.droidlink_code_label)
+        pairing.add(code_row)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.droidlink_pair_button = Gtk.Button(label="Démarrer l’appairage")
+        self.droidlink_pair_button.add_css_class("suggested-action")
+        self.droidlink_pair_button.connect("clicked", self._start_droidlink_pairing)
+        actions.append(self.droidlink_pair_button)
+        self.droidlink_disconnect_button = Gtk.Button(label="Dissocier / retirer le tunnel")
+        self.droidlink_disconnect_button.connect("clicked", self._disconnect_droidlink)
+        actions.append(self.droidlink_disconnect_button)
+        page.append(pairing)
+        page.append(actions)
+
+        page.append(self._heading("Historique des alertes", "Les alertes apparaissent aussi dans le centre de notifications GNOME. Cette vue garde les actions et les éléments épinglés."))
+        self.droidlink_empty = Gtk.Label(label="Aucune notification reçue.", xalign=0)
+        self.droidlink_empty.add_css_class("dim-label")
+        page.append(self.droidlink_empty)
+        self.droidlink_list = Gtk.ListBox()
+        self.droidlink_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.droidlink_list.add_css_class("boxed-list")
+        page.append(self.droidlink_list)
+
+        privacy = Gtk.Label(
+            label="L’accès aux notifications maintient le canal local utilisé pour les commandes du bureau. Les images et le rôle Téléphone demandent leurs autorisations Android dédiées. Les notifications épinglées sont conservées localement; aucune connexion cloud n’est utilisée.",
+            xalign=0,
+        )
+        privacy.set_wrap(True)
+        privacy.add_css_class("dim-label")
+        page.append(privacy)
+        self._render_droidlink_messages()
+        return page
 
     def _add_stack_page(self, child, name, title):
         scroll = Gtk.ScrolledWindow()
@@ -507,13 +597,24 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _build_sms_page(self):
         page = self._page()
-        page.append(self._heading("SMS", "Préparer un message dans l’application Messages du téléphone."))
+        page.append(self._heading("SMS", "Messages récents exposés par les notifications Android et composition sur le téléphone."))
+        recent = Adw.PreferencesGroup.new()
+        recent.set_title("Conversations récentes")
+        recent.set_description("Android fournit ici les messages visibles dans les notifications actives; l’historique complet reste à intégrer.")
+        self.sms_notifications_empty = Gtk.Label(label="Aucune conversation SMS disponible via les notifications.", xalign=0)
+        self.sms_notifications_empty.add_css_class("dim-label")
+        recent.add(self.sms_notifications_empty)
+        self.sms_notification_list = Gtk.ListBox()
+        self.sms_notification_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.sms_notification_list.add_css_class("boxed-list")
+        recent.add(self.sms_notification_list)
+        page.append(recent)
         compose = Adw.PreferencesGroup.new()
         compose.set_title("Nouveau message")
-        compose.set_description("DroidDesk ouvre l’application SMS Android; vérifie le destinataire puis touche Envoyer sur le téléphone.")
+        compose.set_description("Un numéro ou plusieurs destinataires séparés par des virgules; Messages Android confirme l’envoi ou le groupe.")
         self.sms_number_entry = Gtk.Entry()
         self.sms_number_entry.set_input_purpose(Gtk.InputPurpose.PHONE)
-        self.sms_number_entry.set_placeholder_text("Numéro du destinataire")
+        self.sms_number_entry.set_placeholder_text("Numéro(s), séparés par des virgules")
         number_row = Adw.ActionRow.new()
         number_row.set_title("À")
         number_row.add_suffix(self.sms_number_entry)
@@ -538,7 +639,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         compose.add(send_row)
         page.append(compose)
         privacy = Gtk.Label(
-            label="Cette première étape n’envoie ni ne lit les SMS en arrière-plan. L’application SMS du téléphone garde la confirmation et l’historique.",
+            label="Les réponses rapides utilisent l’action fournie par l’application SMS Android. Les nouveaux messages et groupes sont préparés dans Messages; la lecture complète et l’envoi direct de photos/GIF restent à intégrer.",
             xalign=0,
         )
         privacy.set_wrap(True)
@@ -572,7 +673,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _build_bluetooth_page(self):
         page = self._page()
-        page.append(self._heading("Bluetooth", "Adaptateurs, appairage et appareils audio du téléphone."))
+        page.append(self._heading("Bluetooth", "Appairez le téléphone et vérifiez le profil mains libres utilisé pour les appels."))
         adapter_group = Adw.PreferencesGroup.new()
         adapter_group.set_title("Contrôleur Bluetooth")
         self.bt_adapter_row = Adw.ComboRow.new()
@@ -617,7 +718,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         bt_scroll.set_child(self.bt_device_list)
         page.append(bt_scroll)
         self.bt_hint = Gtk.Label(
-            label="L’audio d’appel reste géré par le profil mains libres de BlueZ.", xalign=0
+            label="Pour parler et écouter depuis le PC, Android doit être appairé à Debian comme casque Bluetooth mains libres (HFP/HSP). Le profil audio média A2DP seul ne transporte pas le micro d’appel.", xalign=0
         )
         self.bt_hint.add_css_class("dim-label")
         page.append(self.bt_hint)
@@ -833,15 +934,45 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.answer_button = Gtk.Button(label="Répondre")
         self.answer_button.connect("clicked", self._answer_call)
+        self.reject_call_button = Gtk.Button(label="Refuser")
+        self.reject_call_button.add_css_class("destructive-action")
+        self.reject_call_button.connect("clicked", self._reject_call)
         self.hangup_button = Gtk.Button(label="Terminer l’appel")
         self.hangup_button.add_css_class("destructive-action")
         self.hangup_button.connect("clicked", self._hangup_call)
         controls.append(self.answer_button)
+        controls.append(self.reject_call_button)
         controls.append(self.hangup_button)
         control_row = Adw.ActionRow.new()
         control_row.set_title("Commandes")
         control_row.add_suffix(controls)
         incoming.add(control_row)
+        self.call_link_status = Gtk.Label(label="Aucun appel DroidLink en cours.", xalign=0)
+        self.call_link_status.set_wrap(True)
+        self.call_link_status.add_css_class("dim-label")
+        incoming.add(self.call_link_status)
+        audio_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.call_audio_bluetooth_button = Gtk.Button(label="Audio PC · Bluetooth")
+        self.call_audio_bluetooth_button.set_tooltip_text("Router l’appel vers le profil mains libres Bluetooth du PC")
+        self.call_audio_bluetooth_button.connect("clicked", lambda *_: self._set_call_audio_route("bluetooth"))
+        self.call_audio_speaker_button = Gtk.Button(label="Haut-parleur téléphone")
+        self.call_audio_speaker_button.connect("clicked", lambda *_: self._set_call_audio_route("speaker"))
+        self.call_mute_button = Gtk.ToggleButton(label="Microphone muet")
+        self.call_mute_button.connect("toggled", self._set_call_muted)
+        audio_controls.append(self.call_audio_bluetooth_button)
+        audio_controls.append(self.call_audio_speaker_button)
+        audio_controls.append(self.call_mute_button)
+        audio_row = Adw.ActionRow.new()
+        audio_row.set_title("Audio de l’appel")
+        audio_row.add_suffix(audio_controls)
+        incoming.add(audio_row)
+        audio_hint = Gtk.Label(
+            label="Le son du PC passe par Bluetooth mains libres si Debian est appairé comme casque et si Android propose cette route.",
+            xalign=0,
+        )
+        audio_hint.set_wrap(True)
+        audio_hint.add_css_class("dim-label")
+        incoming.add(audio_hint)
         page.append(incoming)
 
         quick_links = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -855,10 +986,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         note = Gtk.Label(
             label=(
-                "DroidDesk ouvre le composeur du téléphone : l’appel utilise sa carte SIM et doit être confirmé sur Android. Le bouton Répondre envoie "
-                "la commande du bouton de casque Android; si le téléphone ne la reconnaît "
-                "pas, répondez directement dans scrcpy. Le son reste sur le Bluetooth "
-                "mains libres déjà configuré."
+                "Pour les appels intégrés, choisis DroidLink comme application Téléphone par défaut sur Android. Les appels utilisent la SIM du téléphone; "
+                "garde aussi l’accès aux notifications actif dans DroidLink pour recevoir les commandes du bureau. Répondre, refuser, terminer, sélectionner la route audio et couper le micro sont alors pilotables depuis Debian. Le son du PC utilise "
+                "le profil Bluetooth mains libres si le téléphone propose cette route et si Debian est connecté comme casque. Sinon, utilise le haut-parleur ou l’écouteur du téléphone."
             ),
             xalign=0,
         )
@@ -947,6 +1077,12 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.files_refresh_button.set_tooltip_text("Actualiser")
         self.files_refresh_button.connect("clicked", lambda *_: self._load_directory())
         bar.append(self.files_refresh_button)
+        self.photos_dcim_button = Gtk.Button(label="Photos · DCIM")
+        self.photos_dcim_button.connect("clicked", lambda *_: self._open_photo_folder("/sdcard/DCIM"))
+        bar.append(self.photos_dcim_button)
+        self.photos_pictures_button = Gtk.Button(label="Images · Pictures")
+        self.photos_pictures_button.connect("clicked", lambda *_: self._open_photo_folder("/sdcard/Pictures"))
+        bar.append(self.photos_pictures_button)
         self.mkdir_button = Gtk.Button(label="Nouveau dossier")
         self.mkdir_button.connect("clicked", self._new_directory)
         bar.append(self.mkdir_button)
@@ -971,6 +1107,43 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         transfer.append(self.upload_button)
         transfer.append(self.download_button)
         page.append(transfer)
+
+        gallery_group = Adw.PreferencesGroup.new()
+        gallery_group.set_title("Photos récentes")
+        gallery_group.set_description("Jusqu’à 2 000 photos indexées par Android. Les vignettes arrivent au fil de la navigation.")
+        gallery_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.photos_gallery_button = Gtk.Button(label="Charger les photos")
+        self.photos_gallery_button.connect("clicked", self._load_photos_gallery)
+        gallery_controls.append(self.photos_gallery_button)
+        self.photos_open_button = Gtk.Button(label="Aperçu")
+        self.photos_open_button.connect("clicked", self._open_selected_gallery_photo)
+        gallery_controls.append(self.photos_open_button)
+        self.photos_download_button = Gtk.Button(label="Télécharger…")
+        self.photos_download_button.connect("clicked", self._download_selected_gallery_photo)
+        gallery_controls.append(self.photos_download_button)
+        self.photos_external_button = Gtk.Button(label="Ouvrir dans une application")
+        self.photos_external_button.connect("clicked", self._open_selected_photo_externally)
+        gallery_controls.append(self.photos_external_button)
+        gallery_group.add(gallery_controls)
+        self.photos_status = Gtk.Label(label="Autorise les photos dans DroidLink → Accès, puis charge la galerie.", xalign=0)
+        self.photos_status.set_wrap(True)
+        self.photos_status.add_css_class("dim-label")
+        gallery_group.add(self.photos_status)
+        self.photos_flow = Gtk.FlowBox()
+        self.photos_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.photos_flow.set_homogeneous(True)
+        self.photos_flow.set_min_children_per_line(3)
+        self.photos_flow.set_max_children_per_line(7)
+        self.photos_flow.set_row_spacing(10)
+        self.photos_flow.set_column_spacing(10)
+        self.photos_flow.set_valign(Gtk.Align.START)
+        self.photos_scroll = Gtk.ScrolledWindow()
+        self.photos_scroll.set_min_content_height(360)
+        self.photos_scroll.set_max_content_height(620)
+        self.photos_scroll.set_child(self.photos_flow)
+        self.photos_scroll.get_vadjustment().connect("value-changed", self._gallery_scroll_changed)
+        gallery_group.add(self.photos_scroll)
+        page.append(gallery_group)
 
         self.files_note = Gtk.Label(
             label="Le navigateur ouvre le stockage partagé /sdcard; les dossiers privés des applications ne sont pas accessibles sans root.",
@@ -1086,7 +1259,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 self.bt_device_list.append(heading)
                 for path, props in entries:
                     self.bt_device_list.append(self._bt_device_row(path, props))
-        self.bt_hint.set_text("Bluetooth système BlueZ · audio mains libres selon les profils pris en charge par le téléphone.")
+        self.bt_hint.set_text("Appels sur le PC : connecte le téléphone à Debian comme casque mains libres HFP/HSP. Si Android affiche « non valide », oublie Debian dans les deux réglages Bluetooth, relance l’appairage, puis vérifie que le profil Appels est activé pour Debian.")
 
     def _add_bt_empty(self, title, detail):
         row = Gtk.ListBoxRow()
@@ -1132,7 +1305,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if address:
             subtitle += f"  •  {address.upper()}"
         row = Adw.ActionRow.new()
-        row.set_title(name)
+        row.set_title(GLib.markup_escape_text(name))
         row.set_subtitle(subtitle)
         row.add_prefix(Gtk.Image.new_from_icon_name(self._bt_device_icon(props)))
         action = Gtk.Button()
@@ -1160,12 +1333,16 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _bt_device_popover(self, path, props):
         popover = Gtk.Popover.new()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        for title, callback in (
+        options = [
             ("Détails et renommer", lambda: self._show_bt_details(path)),
             ("Ne plus faire confiance" if props.get("Trusted", False) else "Faire confiance", lambda: self._set_bt_device_property(path, "Trusted", not props.get("Trusted", False))),
             ("Débloquer" if props.get("Blocked", False) else "Bloquer", lambda: self._set_bt_device_property(path, "Blocked", not props.get("Blocked", False))),
             ("Oublier l’appareil", lambda: self._confirm_bt_forget(path)),
-        ):
+        ]
+        uuids = {str(uuid).casefold() for uuid in props.get("UUIDs", []) or []}
+        if props.get("Paired") and HFP_AUDIO_GATEWAY_UUID in uuids:
+            options.insert(1, ("Connecter pour les appels · HFP", lambda: self._bt_connect_profile(path, HFP_AUDIO_GATEWAY_UUID)))
+        for title, callback in options:
             button = Gtk.Button(label=title)
             button.add_css_class("flat")
             button.set_halign(Gtk.Align.FILL)
@@ -1173,6 +1350,20 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             box.append(button)
         popover.set_child(box)
         return popover
+
+    def _bt_connect_profile(self, path, uuid):
+        if path in self.bluetooth_busy:
+            return
+        self.bluetooth_busy.add(path)
+        self.update_bluetooth_view()
+        self.bluez.call(
+            path,
+            "org.bluez.Device1",
+            "ConnectProfile",
+            GLib.Variant("(s)", (uuid,)),
+            callback=lambda _reply, error: self._bt_action_done(path, "Connexion du profil mains libres demandée", error),
+            timeout=60_000,
+        )
 
     def _bt_device_action(self, path, method, success, timeout=15_000):
         if path in self.bluetooth_busy:
@@ -1183,7 +1374,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _bt_action_done(self, path, success, error):
         self.bluetooth_busy.discard(path)
-        self._set_status(f"{success} : {_error_text(error)}" if error else success, bool(error))
+        detail = _error_text(error) if error else ""
+        if detail and any(term in detail.casefold() for term in ("invalid", "invalide", "invalidarguments")):
+            detail = f"Le profil Bluetooth demandé a été refusé. Vérifie que le profil Appels est activé pour Debian sur Android. Détail BlueZ : {detail}"
+        self._set_status(f"{success} : {detail}" if error else success, bool(error))
         self.bluez.refresh()
 
     def _set_bt_device_property(self, path, name, value):
@@ -1326,7 +1520,525 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _on_close(self, *_args):
         if hasattr(self, "bluez"):
             self.bluez.close()
+        if getattr(self, "droidlink_bridge", None):
+            self.droidlink_bridge.close()
+        if getattr(self, "droidlink_timer", 0):
+            GLib.source_remove(self.droidlink_timer)
+            self.droidlink_timer = 0
+        if self.photo_preview_dir:
+            self.photo_preview_dir.cleanup()
+            self.photo_preview_dir = None
+        for cache in self.external_photo_dirs:
+            cache.cleanup()
+        self.external_photo_dirs.clear()
         return False
+
+    def _start_droidlink_pairing(self, *_args):
+        if not self.droidlink_bridge:
+            self._set_status("Le serveur local DroidLink n’a pas pu démarrer.", True)
+            return
+        active = self._active_device()
+        if not active:
+            self._set_status("Connectez et sélectionnez le téléphone Android avant l’appairage.", True)
+            return
+        code = self.droidlink_bridge.begin_pairing()
+        self.droidlink_code_label.set_text(f"{code[:3]} {code[3:]}")
+        self._run_adb_command(
+            ["reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
+            "Ouverture du tunnel ADB local pour DroidLink…",
+            self._droidlink_reverse_result,
+        )
+
+    def _droidlink_reverse_result(self, result, error):
+        if error or not result or result.returncode != 0:
+            if self.droidlink_bridge:
+                self.droidlink_bridge.cancel_pairing()
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self.droidlink_code_label.set_text("—")
+            self._set_status(f"Impossible d’ouvrir le tunnel ADB DroidLink : {detail}", True)
+            return
+        self._set_status("Tunnel ADB prêt. Ouvrez DroidLink sur Android et saisissez le code affiché.")
+        self._droidlink_state_changed()
+
+    def _disconnect_droidlink(self, *_args):
+        if self.droidlink_bridge:
+            self.droidlink_bridge.disconnect()
+        self.droidlink_code_label.set_text("—")
+        if self._active_device():
+            self._run_adb_command(
+                ["reverse", "--remove", f"tcp:{PORT}"],
+                "Dissociation de DroidLink et retrait du tunnel ADB…",
+                self._droidlink_reverse_removed,
+            )
+        else:
+            self._set_status("DroidLink dissocié. Le tunnel sera retiré à la prochaine connexion ADB.")
+
+    def _droidlink_reverse_removed(self, result, error):
+        if error or not result or result.returncode != 0:
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self._set_status(f"DroidLink est dissocié; retrait du tunnel ADB impossible : {detail}", True)
+        else:
+            self._set_status("DroidLink dissocié et tunnel ADB retiré.")
+
+    def _droidlink_timer_tick(self):
+        if not getattr(self, "droidlink_bridge", None):
+            return GLib.SOURCE_REMOVE
+        self._droidlink_state_changed()
+        return GLib.SOURCE_CONTINUE
+
+    def _droidlink_state_changed(self):
+        if not getattr(self, "droidlink_bridge", None):
+            return GLib.SOURCE_REMOVE
+        state = self.droidlink_bridge.snapshot()
+        if state["paired"]:
+            phone = state["phone"]
+            name = " ".join(part for part in (phone.get("manufacturer"), phone.get("model")) if part)
+            call_ready = phone.get("dialerRole") and phone.get("notificationAccess") and phone.get("callPhoneAccess")
+            dialer = " · appels PC prêts" if call_ready else ""
+            needs_access = " · active les notifications dans DroidLink" if not phone.get("notificationAccess") else ""
+            if phone.get("dialerRole") and not phone.get("callPhoneAccess"):
+                needs_access += " · autorise les appels sortants dans DroidLink → Accès"
+            self.droidlink_status.set_text(f"Associé · {name or 'Téléphone Android'} · Android {phone.get('android') or '—'}{dialer}{needs_access}")
+            self.droidlink_code_label.set_text("—")
+        elif state["code"]:
+            self.droidlink_status.set_text(f"En attente du téléphone · code valide encore {state['seconds']} s.")
+            code = state["code"]
+            self.droidlink_code_label.set_text(f"{code[:3]} {code[3:]}")
+        else:
+            self.droidlink_status.set_text("Aucun téléphone DroidLink associé.")
+            self.droidlink_code_label.set_text("—")
+        self.droidlink_empty.set_visible(not self.droidlink_messages)
+        self._update_controls()
+        return GLib.SOURCE_REMOVE
+
+    def _droidlink_received(self, event):
+        if event.get("type") == "call_command_error":
+            message = event.get("message") or "Android n’a pas pu exécuter l’appel."
+            self._set_status(message, True)
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "app_icons":
+            for item in event.get("items", []):
+                package = item.get("package", "")
+                encoded = item.get("png", "")
+                if not package or not encoded:
+                    continue
+                try:
+                    data = base64.b64decode(encoded, validate=True)
+                    loader = GdkPixbuf.PixbufLoader.new()
+                    loader.write(data)
+                    loader.close()
+                    pixbuf = loader.get_pixbuf()
+                    if pixbuf:
+                        self.app_icons[package] = pixbuf.copy()
+                        self.app_labels[package] = item.get("label", "")[:100]
+                except (ValueError, GLib.Error):
+                    continue
+            self._render_apps()
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "call_log_list":
+            types = {1: "Entrant", 2: "Sortant", 3: "Manqué", 4: "Messagerie vocale", 5: "Refusé", 6: "Bloqué"}
+            self.recents = []
+            for item in event.get("items", [])[:100]:
+                number = item.get("number", "").strip() or "Numéro masqué"
+                try:
+                    when = datetime.fromtimestamp(int(item.get("date", 0)) / 1000).strftime("%d %b · %H:%M")
+                except (TypeError, ValueError, OSError, OverflowError):
+                    when = ""
+                name = item.get("name", "").strip() or number
+                self.recents.append((name, number, types.get(int(item.get("type", 0)), "Appel"), when))
+            self._render_recents()
+            self.recents_status.set_text(f"{len(self.recents)} appel(s) récent(s) chargé(s) par DroidLink.")
+            self._set_status("Journal d’appels DroidLink actualisé.")
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "call_log_error":
+            message = event.get("message") or "DroidLink ne peut pas lire le journal d’appels."
+            self.recents_status.set_text(message)
+            self._set_status(message, True)
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_list":
+            self._populate_photos_gallery(event.get("items", []))
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_thumbnail":
+            self._display_photo_thumbnail(event)
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_error":
+            message = event.get("message") or "DroidLink n’a pas pu lire les photos du téléphone."
+            self.photos_status.set_text(message)
+            self._set_status(message, True)
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_thumbnail_error":
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "call":
+            state = event.get("state", "IDLE")
+            self.droidlink_call_state = {
+                "state": state,
+                "audioRoute": event.get("audioRoute", "none"),
+                "muted": bool(event.get("muted", False)),
+                "supportedAudioRoutes": int(event.get("supportedAudioRoutes", 0) or 0),
+            }
+            who = event.get("displayName") or event.get("number") or "Numéro inconnu"
+            audio = {
+                "bluetooth": "Bluetooth PC",
+                "speaker": "haut-parleur téléphone",
+                "earpiece": "écouteur téléphone",
+                "wired": "casque filaire",
+            }.get(event.get("audioRoute"), "audio non sélectionné")
+            if event.get("muted"):
+                audio += " · micro muet"
+            labels = {
+                "RINGING": f"Appel entrant · {who} · {audio}",
+                "DIALING": f"Appel en cours vers {who} · {audio}",
+                "ACTIVE": f"En communication avec {who} · {audio}",
+                "HOLDING": f"Appel en attente · {who} · {audio}",
+                "DISCONNECTED": "Appel terminé.",
+                "IDLE": "Aucun appel DroidLink en cours.",
+            }
+            route_status = labels.get(state, f"Appel · {who}")
+            if state in ("RINGING", "DIALING", "ACTIVE", "HOLDING"):
+                routes = self.droidlink_call_state["supportedAudioRoutes"]
+                if routes & 2 and event.get("audioRoute") != "bluetooth":
+                    route_status += " · profil Bluetooth mains libres disponible, en attente de sélection"
+                elif not routes & 2:
+                    route_status += " · Debian n’est pas détecté comme casque mains libres Bluetooth"
+            self.call_link_status.set_text(route_status)
+            if state == "RINGING":
+                self._show_incoming_call_dialog(who, event.get("number", ""))
+            elif self.incoming_call_dialog:
+                self.incoming_call_dialog.close()
+                self.incoming_call_dialog = None
+            self._updating_call_audio_controls = True
+            self.call_mute_button.set_active(bool(event.get("muted", False)))
+            self.call_mute_button.set_label("Microphone muet" if event.get("muted") else "Couper le micro")
+            self._updating_call_audio_controls = False
+            self._update_controls()
+            if state == "RINGING":
+                self._set_status(f"Appel entrant de {who}.")
+            elif state == "IDLE":
+                self._set_status("Aucun appel DroidLink en cours.")
+            else:
+                self._set_status(labels.get(state, f"Appel · {who}"))
+            return GLib.SOURCE_REMOVE
+        key = event.get("key", "")
+        if event.get("removed"):
+            application = self.get_application()
+            if application:
+                application.withdraw_notification(f"android-{key}")
+            for item in self.droidlink_messages:
+                if item.get("key") == key:
+                    item["active"] = False
+            self.sms_notifications = [item for item in self.sms_notifications if item.get("key") != key]
+            self._render_sms_notifications()
+            self.droidlink_messages = [
+                item for item in self.droidlink_messages
+                if item.get("active", True) or item.get("key") in self.droidlink_pinned
+            ]
+            self._save_droidlink_pins()
+            self._render_droidlink_messages()
+            return GLib.SOURCE_REMOVE
+        event["pinned"] = event.get("key", "") in self.droidlink_pinned
+        event["active"] = True
+        self._send_gnome_notification(event)
+        existing = next((index for index, item in enumerate(self.droidlink_messages) if key and item.get("key") == key), None)
+        if existing is None:
+            self.droidlink_messages.insert(0, event)
+        else:
+            self.droidlink_messages[existing] = event
+        if event.get("isSmsApp"):
+            self.sms_notifications = [item for item in self.sms_notifications if item.get("key") != key]
+            self.sms_notifications.insert(0, event)
+            self.sms_notifications = self.sms_notifications[:30]
+        else:
+            self.sms_notifications = [item for item in self.sms_notifications if item.get("key") != key]
+        self._render_sms_notifications()
+        pinned = [item for item in self.droidlink_messages if item.get("key") in self.droidlink_pinned]
+        recent = [item for item in self.droidlink_messages if item.get("key") not in self.droidlink_pinned]
+        self.droidlink_messages = pinned[:50] + recent[:max(0, 50 - len(pinned))]
+        self._save_droidlink_pins()
+        self._render_droidlink_messages()
+        self._set_status("Nouvelle notification reçue par DroidLink.")
+        return GLib.SOURCE_REMOVE
+
+    def _send_gnome_notification(self, event):
+        application = self.get_application()
+        if not application:
+            return
+        title = event.get("title") or event.get("app") or "Notification Android"
+        body = event.get("text", "")
+        messages = event.get("messages", [])
+        if messages:
+            latest = messages[-1]
+            snippet = latest.get("text", "")
+            sender = latest.get("sender", "")
+            if snippet:
+                body = f"{sender}: {snippet}" if sender else snippet
+        notification = Gio.Notification.new(title[:180])
+        if body:
+            notification.set_body(body[:800])
+        notification.set_icon(Gio.ThemedIcon.new("phone-symbolic"))
+        key = event.get("key", "")
+        if key:
+            notification.set_default_action_and_target(
+                "app.open-android-notification", GLib.Variant("s", key)
+            )
+            reply_action = next(
+                (action for action in event.get("actions", []) if action.get("remoteInputKey")),
+                None,
+            )
+            if reply_action:
+                target = json.dumps(
+                    {
+                        "key": key,
+                        "index": reply_action.get("index", -1),
+                        "remoteInputKey": reply_action.get("remoteInputKey", ""),
+                        "title": reply_action.get("title") or "Répondre",
+                    },
+                    ensure_ascii=False,
+                )
+                notification.add_button_with_target(
+                    "Répondre", "app.reply-android-notification", GLib.Variant("s", target)
+                )
+        application.send_notification(f"android-{key or title[:80]}", notification)
+
+    def _show_incoming_call_dialog(self, caller, number):
+        if self.incoming_call_dialog:
+            return
+        dialog = Adw.MessageDialog.new(self, "Appel entrant", caller or number or "Numéro inconnu")
+        if number and number != caller:
+            dialog.set_body(number)
+        dialog.add_response("decline", "Refuser")
+        dialog.add_response("answer", "Répondre")
+        dialog.set_response_appearance("decline", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_appearance("answer", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("answer")
+        dialog.connect("response", self._incoming_call_response)
+        self.incoming_call_dialog = dialog
+        dialog.present()
+
+    def _incoming_call_response(self, dialog, response):
+        self.incoming_call_dialog = None
+        if response == "answer":
+            self._queue_droidlink_call("answer_call")
+        elif response == "decline":
+            self._queue_droidlink_call("reject_call")
+
+    def _render_sms_notifications(self):
+        if not hasattr(self, "sms_notification_list"):
+            return
+        child = self.sms_notification_list.get_first_child()
+        while child:
+            self.sms_notification_list.remove(child)
+            child = self.sms_notification_list.get_first_child()
+        self.sms_notifications_empty.set_visible(not self.sms_notifications)
+        for event in self.sms_notifications:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+            row.set_margin_top(8)
+            row.set_margin_bottom(8)
+            row.set_margin_start(10)
+            row.set_margin_end(10)
+            heading = event.get("conversationTitle") or event.get("title") or "SMS"
+            title = Gtk.Label(label=heading, xalign=0)
+            title.add_css_class("heading")
+            row.append(title)
+            messages = event.get("messages", [])
+            if messages:
+                for message in messages[-8:]:
+                    text = message.get("text", "")
+                    if not text and message.get("mediaType"):
+                        text = f"Média reçu · {message['mediaType']}"
+                    if not text:
+                        continue
+                    sender = message.get("sender", "")
+                    bubble = Gtk.Label(label=f"{sender}: {text}" if sender else text, xalign=0)
+                    bubble.set_wrap(True)
+                    bubble.set_selectable(True)
+                    bubble.add_css_class("card")
+                    row.append(bubble)
+            elif event.get("text"):
+                body = Gtk.Label(label=event["text"], xalign=0)
+                body.set_wrap(True)
+                body.set_selectable(True)
+                row.append(body)
+            if event.get("isGroupConversation"):
+                group_label = Gtk.Label(label="Conversation de groupe", xalign=0)
+                group_label.add_css_class("dim-label")
+                row.append(group_label)
+            key = event.get("key", "")
+            if key and event.get("active", True):
+                for phone_action in event.get("actions", []):
+                    remote_key = phone_action.get("remoteInputKey", "")
+                    action_index = phone_action.get("index", -1)
+                    if remote_key and action_index >= 0:
+                        reply = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        entry = Gtk.Entry()
+                        entry.set_hexpand(True)
+                        entry.set_placeholder_text("Répondre au SMS…")
+                        reply.append(entry)
+                        send = Gtk.Button(label=phone_action.get("title") or "Répondre")
+                        send.add_css_class("suggested-action")
+                        send.connect(
+                            "clicked",
+                            lambda _button, field=entry, notification_key=key, index=action_index, result_key=remote_key, title=phone_action.get("title", "Répondre"):
+                            self._send_droidlink_notification_action(notification_key, index, result_key, field.get_text(), title),
+                        )
+                        reply.append(send)
+                        row.append(reply)
+                open_button = Gtk.Button(label="Ouvrir la conversation sur Android")
+                open_button.connect("clicked", lambda *_args, notification_key=key: self._send_droidlink_command("open", notification_key))
+                row.append(open_button)
+            self.sms_notification_list.append(row)
+
+    def _render_droidlink_messages(self):
+        child = self.droidlink_list.get_first_child()
+        while child:
+            self.droidlink_list.remove(child)
+            child = self.droidlink_list.get_first_child()
+        self.droidlink_messages.sort(key=lambda event: event.get("key", "") in self.droidlink_pinned, reverse=True)
+        for event in self.droidlink_messages:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            row.add_css_class("card")
+            row.set_margin_start(6)
+            row.set_margin_end(6)
+            row.set_margin_top(4)
+            row.set_margin_bottom(4)
+            title = event.get("title") or event.get("app") or "Notification Android"
+            title_label = Gtk.Label(label=title, xalign=0)
+            title_label.add_css_class("heading")
+            row.append(title_label)
+            body = event.get("text", "")
+            if body:
+                body_label = Gtk.Label(label=body, xalign=0)
+                body_label.set_wrap(True)
+                row.append(body_label)
+            posted = event.get("postedAt", 0)
+            try:
+                when = datetime.fromtimestamp(posted / 1000).strftime("%H:%M") if posted else ""
+            except (OSError, OverflowError, ValueError):
+                when = ""
+            metadata = " · ".join(part for part in (event.get("app", ""), when) if part)
+            if metadata:
+                metadata_label = Gtk.Label(label=metadata, xalign=0)
+                metadata_label.add_css_class("dim-label")
+                row.append(metadata_label)
+            key = event.get("key", "")
+            if key and event.get("active", True):
+                for phone_action in event.get("actions", []):
+                    action_title = phone_action.get("title") or "Action Android"
+                    action_index = phone_action.get("index", -1)
+                    remote_key = phone_action.get("remoteInputKey", "")
+                    if action_index < 0:
+                        continue
+                    if remote_key:
+                        reply_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        reply_entry = Gtk.Entry()
+                        reply_entry.set_hexpand(True)
+                        reply_entry.set_placeholder_text(f"Répondre · {action_title}")
+                        reply_row.append(reply_entry)
+                        reply_button = Gtk.Button(label=action_title)
+                        reply_button.add_css_class("suggested-action")
+                        reply_button.connect(
+                            "clicked",
+                            lambda _button, entry=reply_entry, notification_key=key, index=action_index, result_key=remote_key, title=action_title:
+                            self._send_droidlink_notification_action(notification_key, index, result_key, entry.get_text(), title),
+                        )
+                        reply_row.append(reply_button)
+                        row.append(reply_row)
+                    else:
+                        phone_button = Gtk.Button(label=action_title)
+                        phone_button.connect(
+                            "clicked",
+                            lambda *_args, notification_key=key, index=action_index, title=action_title:
+                            self._send_droidlink_notification_action(notification_key, index, action_title=title),
+                        )
+                        row.append(phone_button)
+                actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                open_button = Gtk.Button.new_from_icon_name("document-open-symbolic")
+                open_button.set_tooltip_text("Ouvrir sur le téléphone")
+                open_button.connect("clicked", lambda *_args, notification_key=key: self._send_droidlink_command("open", notification_key))
+                actions.append(open_button)
+                pinned = key in self.droidlink_pinned
+                pin_button = Gtk.Button(label="Épinglée" if pinned else "Épingler")
+                pin_button.set_tooltip_text("Conserver cette notification en haut de la liste")
+                pin_button.connect("clicked", lambda *_args, notification_key=key: self._toggle_droidlink_pin(notification_key))
+                actions.append(pin_button)
+                dismiss_button = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+                dismiss_button.set_tooltip_text("Ignorer sur le téléphone")
+                dismiss_button.connect("clicked", lambda *_args, notification_key=key: self._send_droidlink_command("dismiss", notification_key))
+                actions.append(dismiss_button)
+                row.append(actions)
+            elif key:
+                archived = Gtk.Label(label="Notification épinglée · retirée du téléphone", xalign=0)
+                archived.add_css_class("dim-label")
+                row.append(archived)
+            self.droidlink_list.append(row)
+        self.droidlink_empty.set_visible(not self.droidlink_messages)
+
+    def _send_droidlink_command(self, action, key):
+        if not self.droidlink_bridge or not self.droidlink_bridge.enqueue_command(action, key):
+            self._set_status("Associez DroidLink avant de contrôler les notifications.", True)
+            return
+        if action == "dismiss":
+            if key in self.droidlink_pinned:
+                for item in self.droidlink_messages:
+                    if item.get("key") == key:
+                        item["active"] = False
+            else:
+                self.droidlink_messages = [item for item in self.droidlink_messages if item.get("key") != key]
+            self._save_droidlink_pins()
+            self._render_droidlink_messages()
+            self._set_status("La notification sera ignorée sur le téléphone au prochain échange ADB.")
+        else:
+            self._set_status("Ouverture de la notification demandée sur Android.")
+
+    def _send_droidlink_notification_action(self, key, index, remote_input_key="", text="", action_title=""):
+        if remote_input_key and not text.strip():
+            self._set_status("Écris une réponse avant de l’envoyer.", True)
+            return
+        if not self.droidlink_bridge or not self.droidlink_bridge.enqueue_command(
+            "notification_action",
+            key,
+            actionIndex=index,
+            remoteInputKey=remote_input_key,
+            text=text,
+            actionTitle=action_title,
+        ):
+            self._set_status("Associez DroidLink avant d’utiliser les actions de cette notification.", True)
+            return
+        self._set_status("Action envoyée au téléphone via DroidLink.")
+
+    def _toggle_droidlink_pin(self, key):
+        if key in self.droidlink_pinned:
+            self.droidlink_pinned.remove(key)
+        else:
+            self.droidlink_pinned.add(key)
+        for event in self.droidlink_messages:
+            if event.get("key") == key:
+                event["pinned"] = key in self.droidlink_pinned
+        self._save_droidlink_pins()
+        self._render_droidlink_messages()
+
+    @staticmethod
+    def _droidlink_pins_path():
+        return Path(GLib.get_user_data_dir()) / APP_ID / "droidlink-pins.json"
+
+    def _load_droidlink_pins(self):
+        try:
+            values = json.loads(self._droidlink_pins_path().read_text(encoding="utf-8"))
+            if isinstance(values, dict):
+                messages = [item for item in values.get("messages", []) if isinstance(item, dict) and item.get("key")]
+                return {item["key"] for item in messages}, messages[:50]
+        except (OSError, ValueError, TypeError):
+            pass
+        return set(), []
+
+    def _save_droidlink_pins(self):
+        path = self._droidlink_pins_path()
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            messages = [item for item in self.droidlink_messages if item.get("key") in self.droidlink_pinned]
+            path.write_text(json.dumps({"messages": messages}, ensure_ascii=False), encoding="utf-8")
+            path.chmod(0o600)
+        except OSError as error:
+            self._set_status(f"Impossible d’enregistrer les notifications épinglées : {error}", True)
 
     def _ask_adb_pair(self, *_args):
         self._show_adb_connection_dialog(pair=True)
@@ -1511,6 +2223,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         for widget in (
             self.dial_button,
             self.answer_button,
+            self.reject_call_button,
             self.hangup_button,
             self.scrcpy_button,
             self.apps_refresh_button,
@@ -1518,6 +2231,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.sms_open_button,
             self.up_button,
             self.files_refresh_button,
+            self.photos_dcim_button,
+            self.photos_pictures_button,
             self.mkdir_button,
             self.upload_button,
             self.info_refresh_button,
@@ -1546,6 +2261,34 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.file_list.set_sensitive(ready)
         self.download_button.set_sensitive(ready and self._selected_remote_file() is not None)
         self.device_picker.set_sensitive(bool(self.devices) and not self.busy)
+        linked = False
+        if self.droidlink_bridge:
+            state = self.droidlink_bridge.snapshot()
+            linked = state["paired"] or bool(state["code"])
+            self.droidlink_pair_button.set_label(
+                "Téléphone associé" if state["paired"] else "Renouveler le code" if state["code"] else "Démarrer l’appairage"
+            )
+            self.droidlink_pair_button.set_sensitive(ready and not state["paired"])
+        else:
+            self.droidlink_pair_button.set_sensitive(False)
+            state = {"paired": False, "phone": {}}
+        integrated_call_controls = (
+            ready
+            and state["paired"]
+            and state["phone"].get("dialerRole")
+            and state["phone"].get("notificationAccess")
+            and self.droidlink_call_state.get("state") not in ("IDLE", "DISCONNECTED")
+        )
+        supported_routes = self.droidlink_call_state.get("supportedAudioRoutes", 0)
+        self.call_audio_bluetooth_button.set_sensitive(integrated_call_controls and bool(supported_routes & 2))
+        self.call_audio_speaker_button.set_sensitive(integrated_call_controls and bool(supported_routes & 8))
+        self.call_mute_button.set_sensitive(integrated_call_controls)
+        photo_path_available = self._selected_gallery_photo() is not None
+        self.photos_gallery_button.set_sensitive(ready and state["paired"] and state["phone"].get("notificationAccess"))
+        self.photos_open_button.set_sensitive(ready and photo_path_available)
+        self.photos_download_button.set_sensitive(ready and photo_path_available)
+        self.photos_external_button.set_sensitive(ready and photo_path_available)
+        self.droidlink_disconnect_button.set_sensitive(linked and not self.busy)
         for widget in (
             self.device_refresh_button,
             self.adb_start_button,
@@ -1579,6 +2322,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.phone_thumb.queue_draw()
 
     def _on_page_changed(self, *_args):
+        if self.stack.get_visible_child_name() == "droidlink":
+            self._droidlink_state_changed()
         self._load_current_page()
 
     def _load_current_page(self):
@@ -1746,7 +2491,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         visible = [(name, number) for name, number in self.contacts if query in name.casefold() or query in number.casefold()]
         for name, number in visible:
             row = Adw.ActionRow.new()
-            row.set_title(name)
+            row.set_title(GLib.markup_escape_text(name))
             row.set_subtitle(number)
             row.add_prefix(Gtk.Image.new_from_icon_name("avatar-default-symbolic"))
             button = Gtk.Button.new_from_icon_name("call-start-symbolic")
@@ -1764,6 +2509,22 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.contact_list.append(row)
 
     def _refresh_recents(self, *_args):
+        if self.droidlink_bridge:
+            state = self.droidlink_bridge.snapshot()
+            phone = state.get("phone", {})
+            if state["paired"] and phone.get("dialerRole") and phone.get("notificationAccess") and phone.get("callLogAccess"):
+                if self.droidlink_bridge.enqueue_command("call_log_list", ""):
+                    self.recents_status.set_text("Lecture du journal d’appels par DroidLink…")
+                    self._set_status("DroidLink lit le journal d’appels autorisé sur Android.")
+                    return
+            elif state["paired"] and phone.get("dialerRole") and not phone.get("callLogAccess"):
+                self.recents_status.set_text("Autorise l’historique d’appels dans DroidLink → Accès, puis actualise.")
+                self._set_status("Autorise la permission du journal d’appels dans DroidLink → Accès.", True)
+                return
+            elif state["paired"] and phone.get("dialerRole") and not phone.get("notificationAccess"):
+                self.recents_status.set_text("Active le relais de notifications dans DroidLink pour synchroniser l’historique.")
+                self._set_status("Active le relais de notifications pour synchroniser le journal DroidLink.", True)
+                return
         self.recents_status.set_text("Lecture du journal d’appels…")
         self._run_adb_command(
             ["shell", "content", "query", "--uri", "content://call_log/calls", "--projection", "number:type:date:duration:name"],
@@ -1839,7 +2600,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.recent_list.remove(child)
         for name, number, call_type, when in self.recents:
             row = Adw.ActionRow.new()
-            row.set_title(name)
+            row.set_title(GLib.markup_escape_text(name))
             row.set_subtitle(" · ".join(part for part in (number, call_type, when) if part))
             icon = "call-incoming-symbolic" if call_type == "Entrant" else "call-outgoing-symbolic" if call_type == "Sortant" else "call-missed-symbolic" if call_type == "Manqué" else "call-start-symbolic"
             row.add_prefix(Gtk.Image.new_from_icon_name(icon))
@@ -1865,14 +2626,18 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if not active:
             return
         raw = self.sms_number_entry.get_text().strip()
-        if not re.fullmatch(r"\+?[\d\s().-]+", raw):
-            self._set_status("Entre un numéro de téléphone valide.", True)
+        recipients = [item.strip() for item in re.split(r"[;,]", raw) if item.strip()]
+        if not recipients or len(recipients) > 10 or any(not re.fullmatch(r"\+?[\d\s().-]+", item) for item in recipients):
+            self._set_status("Entre un à dix numéros valides, séparés par des virgules.", True)
             return
-        digits = re.sub(r"\D", "", raw)
-        if not digits:
-            self._set_status("Le numéro du destinataire est vide.", True)
-            return
-        number = ("+" if raw.startswith("+") else "") + digits
+        numbers = []
+        for recipient in recipients:
+            digits = re.sub(r"\D", "", recipient)
+            if len(digits) < 3:
+                self._set_status("Chaque numéro doit contenir au moins trois chiffres.", True)
+                return
+            numbers.append(("+" if recipient.startswith("+") else "") + digits)
+        number = ";".join(numbers)
         buffer = self.sms_body_view.get_buffer()
         start, end = buffer.get_bounds()
         body = buffer.get_text(start, end, True).strip()
@@ -1952,6 +2717,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if len(digits) < 3:
             self._set_status("Le numéro semble trop court.", True)
             return
+        if self._queue_droidlink_call("place_call", number=number):
+            return
         self._run_adb_command(
             ["shell", "am", "start", "-a", "android.intent.action.DIAL", "-d", f"tel:{number}"],
             "Ouverture du composeur Android…",
@@ -1966,6 +2733,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self._set_status("Composeur du téléphone ouvert : confirme l’appel dans Android; la SIM du cellulaire passera l’appel.")
 
     def _answer_call(self, *_args):
+        if self._queue_droidlink_call("answer_call"):
+            return
         active = self._active_device()
         if not active:
             return
@@ -1976,12 +2745,71 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             lambda result, error: self._command_status(result, error, "Réponse demandée."),
         )
 
+    def _reject_call(self, *_args):
+        if self._queue_droidlink_call("reject_call"):
+            return
+        self._run_adb_command(
+            ["shell", "input", "keyevent", "KEYCODE_ENDCALL"],
+            "Commande de refus d’appel envoyée au téléphone…",
+            lambda result, error: self._command_status(result, error, "Refus demandé."),
+        )
+
     def _hangup_call(self, *_args):
+        if self._queue_droidlink_call("hangup_call"):
+            return
         self._run_adb_command(
             ["shell", "input", "keyevent", "KEYCODE_ENDCALL"],
             "Commande de fin d’appel envoyée…",
             lambda result, error: self._command_status(result, error, "Fin d’appel demandée."),
         )
+
+    def _queue_droidlink_call(self, action, number=""):
+        if not self.droidlink_bridge:
+            return False
+        state = self.droidlink_bridge.snapshot()
+        if not state["paired"]:
+            return False
+        phone = state.get("phone", {})
+        if not phone.get("dialerRole"):
+            self._set_status("Choisis DroidLink comme application Téléphone sur Android pour les appels intégrés.", True)
+            return True
+        if not phone.get("notificationAccess"):
+            self._set_status("Active l’accès aux notifications dans DroidLink → Accès pour recevoir les commandes du PC.", True)
+            return True
+        if action == "place_call" and not phone.get("callPhoneAccess"):
+            self._set_status("Autorise les appels sortants dans DroidLink → Accès, puis réessaie.", True)
+            return True
+        details = {"number": number} if number else {}
+        if not self.droidlink_bridge.enqueue_command(action, "", **details):
+            self._set_status("DroidLink n’est pas associé au téléphone.", True)
+            return False
+        label = {
+            "place_call": f"Appel de {number} demandé à DroidLink…",
+            "answer_call": "Réponse à l’appel demandée à DroidLink…",
+            "reject_call": "Refus de l’appel demandé à DroidLink…",
+            "hangup_call": "Fin de l’appel demandée à DroidLink…",
+            "call_audio_bluetooth": "Route audio Bluetooth demandée à Android…",
+            "call_audio_speaker": "Haut-parleur du téléphone demandé…",
+            "call_audio_earpiece": "Écouteur du téléphone demandé…",
+            "call_mute_on": "Microphone coupé…",
+            "call_mute_off": "Microphone réactivé…",
+        }.get(action, "Commande d’appel envoyée à DroidLink.")
+        self._set_status(label)
+        return True
+
+    def _set_call_audio_route(self, route):
+        action = {
+            "bluetooth": "call_audio_bluetooth",
+            "speaker": "call_audio_speaker",
+            "earpiece": "call_audio_earpiece",
+        }.get(route)
+        if action:
+            self._queue_droidlink_call(action)
+
+    def _set_call_muted(self, button):
+        if self._updating_call_audio_controls:
+            return
+        self._queue_droidlink_call("call_mute_on" if button.get_active() else "call_mute_off")
 
     def _command_status(self, result, error, success):
         if error or not result or result.returncode != 0:
@@ -2034,6 +2862,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if packages:
             self.app_packages = sorted(set(packages))
             self._render_apps()
+            self._request_app_icons()
             self._set_status(f"{len(self.app_packages)} application(s) lançable(s).")
             return
         self._run_adb_command(
@@ -2054,7 +2883,20 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         )
         self.app_packages = packages
         self._render_apps()
+        self._request_app_icons()
         self._set_status(f"{len(packages)} application(s) utilisateur(s) listée(s).")
+
+    def _request_app_icons(self):
+        if not self.droidlink_bridge:
+            return
+        state = self.droidlink_bridge.snapshot()
+        if not state["paired"] or not state["phone"].get("notificationAccess"):
+            return
+        missing = [package for package in self.app_packages if package not in self.app_icons]
+        for start in range(0, len(missing), 10):
+            self.droidlink_bridge.enqueue_command(
+                "app_icons", "", packages=missing[start : start + 10]
+            )
 
     def _on_apps_search(self, entry, *_args):
         self.app_search_text = entry.get_text().strip().casefold()
@@ -2083,6 +2925,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         name = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
         return name.replace("_", " ").strip().title() or package
 
+    def _display_app_label(self, package):
+        return self.app_labels.get(package) or self._app_label(package)
+
     @staticmethod
     def _app_icon(package):
         value = package.casefold()
@@ -2103,7 +2948,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _render_apps(self):
         while child := self.apps_flow.get_first_child():
             self.apps_flow.remove(child)
-        packages = [package for package in self.app_packages if self.app_search_text in package.casefold() or self.app_search_text in self._app_label(package).casefold()]
+        packages = [package for package in self.app_packages if self.app_search_text in package.casefold() or self.app_search_text in self._display_app_label(package).casefold()]
         for package in packages:
             button = Gtk.Button()
             button.add_css_class("card")
@@ -2114,10 +2959,18 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             content.set_margin_bottom(12)
             content.set_margin_start(8)
             content.set_margin_end(8)
-            icon = Gtk.Image.new_from_icon_name(self._app_icon(package))
-            icon.set_pixel_size(32)
+            icon = Gtk.Image()
+            pixbuf = self.app_icons.get(package)
+            if pixbuf:
+                icon.set_from_pixbuf(
+                    pixbuf.scale_simple(56, 56, GdkPixbuf.InterpType.BILINEAR) or pixbuf
+                )
+                icon.set_size_request(56, 56)
+            else:
+                icon.set_from_icon_name(self._app_icon(package))
+                icon.set_pixel_size(40)
             content.append(icon)
-            label = Gtk.Label(label=self._app_label(package))
+            label = Gtk.Label(label=self._display_app_label(package))
             label.set_ellipsize(Pango.EllipsizeMode.END)
             label.set_max_width_chars(15)
             content.append(label)
@@ -2308,6 +3161,246 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if record and record[1]:
             self.remote_dir = record[2]
             self._load_directory()
+        elif record and Path(record[0]).suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif",
+        }:
+            self._preview_remote_image(record[2])
+
+    def _open_photo_folder(self, path):
+        self.remote_dir = self._remote_path(path)
+        self._load_directory()
+
+    @staticmethod
+    def _safe_media_path(path):
+        normalized = posixpath.normpath(str(path))
+        if normalized.startswith(("/storage/", "/sdcard/")) and "/../" not in f"{normalized}/" and "\x00" not in normalized:
+            return normalized
+        return None
+
+    def _load_photos_gallery(self, *_args):
+        if not self.droidlink_bridge:
+            self._set_status("Le pont DroidLink n’est pas disponible.", True)
+            return
+        state = self.droidlink_bridge.snapshot()
+        if not state["paired"] or not state["phone"].get("notificationAccess"):
+            self.photos_status.set_text("Associe DroidLink, active le relais de notifications, puis autorise Photos dans l’application Android.")
+            self._set_status("Associe d’abord DroidLink pour charger la galerie.", True)
+            return
+        if not self.droidlink_bridge.enqueue_command("photo_list", ""):
+            self._set_status("Impossible d’envoyer la demande de galerie.", True)
+            return
+        self.photos_status.set_text("Lecture des photos récentes sur le téléphone…")
+        self._set_status("DroidLink prépare la galerie du téléphone…")
+
+    def _populate_photos_gallery(self, items):
+        child = self.photos_flow.get_first_child()
+        while child:
+            self.photos_flow.remove(child)
+            child = self.photos_flow.get_first_child()
+        self.gallery_photos = [
+            item for item in items[:2_000]
+            if isinstance(item, dict) and int(item.get("id", 0) or 0) > 0
+        ]
+        self.gallery_cards.clear()
+        self.gallery_requested_thumbnails.clear()
+        self.gallery_selected = None
+        for photo in self.gallery_photos:
+            photo_id = int(photo["id"])
+            card = Gtk.Button()
+            card.add_css_class("card")
+            card.set_size_request(154, 150)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            content.set_margin_top(8)
+            content.set_margin_bottom(8)
+            content.set_margin_start(8)
+            content.set_margin_end(8)
+            thumbnail = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+            thumbnail.set_pixel_size(64)
+            thumbnail.set_size_request(134, 100)
+            content.append(thumbnail)
+            name = Gtk.Label(label=photo.get("name") or "Image", xalign=0)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_max_width_chars(20)
+            name.add_css_class("caption")
+            content.append(name)
+            card.set_child(content)
+            card.connect("clicked", lambda _button, record=photo: self._select_gallery_photo(record))
+            self.photos_flow.append(card)
+            self.gallery_cards[photo_id] = {"button": card, "image": thumbnail, "photo": photo}
+        count = len(self.gallery_photos)
+        self.photos_status.set_text(f"{count:,} photo{'s' if count != 1 else ''} trouvée{'s' if count != 1 else ''} · les vignettes se chargent quand tu navigues.".replace(",", " "))
+        if count:
+            self._request_photo_thumbnails(0, min(36, count))
+        else:
+            self.photos_status.set_text("Aucune photo accessible. Vérifie l’autorisation média sur le téléphone.")
+        self._update_controls()
+
+    def _select_gallery_photo(self, photo):
+        if self.gallery_selected:
+            old = self.gallery_cards.get(int(self.gallery_selected.get("id", 0)))
+            if old:
+                old["button"].remove_css_class("suggested-action")
+        self.gallery_selected = photo
+        current = self.gallery_cards.get(int(photo.get("id", 0)))
+        if current:
+            current["button"].add_css_class("suggested-action")
+        self._update_controls()
+
+    def _gallery_scroll_changed(self, adjustment):
+        count = len(self.gallery_photos)
+        if count < 37:
+            return
+        maximum = max(0.0, adjustment.get_upper() - adjustment.get_page_size())
+        if maximum <= 0:
+            return
+        first = int((adjustment.get_value() / maximum) * count)
+        self._request_photo_thumbnails(max(0, first - 12), min(48, count))
+
+    def _request_photo_thumbnails(self, start, count):
+        if not self.droidlink_bridge:
+            return
+        state = self.droidlink_bridge.snapshot()
+        if not state["paired"]:
+            return
+        stop = min(len(self.gallery_photos), start + count)
+        for photo in self.gallery_photos[start:stop]:
+            photo_id = int(photo["id"])
+            if photo_id in self.gallery_requested_thumbnails:
+                continue
+            if self.droidlink_bridge.enqueue_command("photo_thumbnail", "", photoId=photo_id):
+                self.gallery_requested_thumbnails.add(photo_id)
+
+    def _display_photo_thumbnail(self, event):
+        try:
+            photo_id = int(event.get("id", 0))
+            encoded = event.get("jpeg", "")
+            data = base64.b64decode(encoded, validate=True)
+            loader = GdkPixbuf.PixbufLoader.new()
+            loader.write(data)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            card = self.gallery_cards.get(photo_id)
+            if card and pixbuf:
+                card["image"].set_from_pixbuf(pixbuf)
+        except (ValueError, TypeError, GLib.Error):
+            return
+
+    def _selected_gallery_photo(self):
+        photo = self.gallery_selected
+        return photo if photo and self._safe_media_path(photo.get("path", "")) else None
+
+    def _open_selected_gallery_photo(self, *_args):
+        photo = self._selected_gallery_photo()
+        if photo:
+            self._preview_remote_image(self._safe_media_path(photo["path"]))
+
+    def _download_selected_gallery_photo(self, *_args):
+        photo = self._selected_gallery_photo()
+        if not photo:
+            return
+        chooser = Gtk.FileChooserNative.new(
+            "Télécharger cette photo",
+            self,
+            Gtk.FileChooserAction.SELECT_FOLDER,
+            "Télécharger",
+            "Annuler",
+        )
+
+        def response(dialog, answer):
+            if answer == Gtk.ResponseType.ACCEPT:
+                folder = dialog.get_file()
+                if folder and folder.get_path():
+                    self._download_file(self._safe_media_path(photo["path"]), folder.get_path())
+            dialog.destroy()
+
+        chooser.connect("response", response)
+        chooser.show()
+
+    def _open_selected_photo_externally(self, *_args):
+        photo = self._selected_gallery_photo()
+        active = self._active_device()
+        if not photo or not active:
+            return
+        cache = tempfile.TemporaryDirectory(prefix="droiddesk-photo-open-")
+        local_path = Path(cache.name) / Path(photo.get("name") or f"photo-{photo['id']}.jpg").name
+        self.external_photo_dirs.append(cache)
+        self._run_adb_command(
+            ["pull", self._safe_media_path(photo["path"]), str(local_path)],
+            f"Préparation de {local_path.name}…",
+            lambda result, error: self._launch_external_photo(cache, local_path, result, error),
+            timeout=90,
+        )
+
+    def _launch_external_photo(self, cache, local_path, result, error):
+        if error or not result or result.returncode != 0 or not local_path.is_file():
+            if cache in self.external_photo_dirs:
+                self.external_photo_dirs.remove(cache)
+            cache.cleanup()
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self._set_status(f"Impossible de transférer la photo : {detail}", True)
+            return
+        try:
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(str(local_path)).get_uri(), None)
+            self._set_status(f"Ouverture de {local_path.name} dans l’application associée.")
+        except GLib.Error as error:
+            self._set_status(f"Aucune application ne peut ouvrir cette image : {error.message}", True)
+
+    def _preview_remote_image(self, remote_path):
+        if self.photo_preview_window:
+            self.photo_preview_window.close()
+            self.photo_preview_window = None
+        if self.photo_preview_dir:
+            self.photo_preview_dir.cleanup()
+        preview_dir = tempfile.TemporaryDirectory(prefix="droiddesk-photo-")
+        local_path = Path(preview_dir.name) / posixpath.basename(remote_path)
+        self.photo_preview_dir = preview_dir
+        self._run_adb_command(
+            ["pull", remote_path, str(local_path)],
+            f"Chargement de {posixpath.basename(remote_path)}…",
+            lambda result, error: self._show_photo_preview(preview_dir, local_path, result, error),
+            timeout=90,
+        )
+
+    def _show_photo_preview(self, preview_dir, local_path, result, error):
+        if error or not result or result.returncode != 0 or not local_path.is_file():
+            preview_dir.cleanup()
+            if self.photo_preview_dir is preview_dir:
+                self.photo_preview_dir = None
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self._set_status(f"Impossible d’afficher la photo : {detail}", True)
+            return
+        picture = Gtk.Picture.new_for_filename(str(local_path))
+        picture.set_can_shrink(True)
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        drag_source = Gtk.DragSource()
+        drag_source.set_actions(Gdk.DragAction.COPY)
+
+        def prepare_drag(*_args):
+            uri_list = Gio.File.new_for_path(str(local_path)).get_uri() + "\r\n"
+            payload = GLib.Bytes.new(uri_list.encode("utf-8"))
+            return Gdk.ContentProvider.new_for_bytes("text/uri-list", payload)
+
+        drag_source.connect("prepare", prepare_drag)
+        picture.add_controller(drag_source)
+        viewer = Gtk.ScrolledWindow()
+        viewer.set_child(picture)
+        window = Gtk.Window(transient_for=self)
+        window.set_title(local_path.name)
+        window.set_default_size(900, 700)
+        window.set_child(viewer)
+
+        def closed(*_args):
+            preview_dir.cleanup()
+            if self.photo_preview_dir is preview_dir:
+                self.photo_preview_dir = None
+            if self.photo_preview_window is window:
+                self.photo_preview_window = None
+            return False
+
+        window.connect("close-request", closed)
+        self.photo_preview_window = window
+        window.present()
+        self._set_status(f"Aperçu photo : {local_path.name}")
 
     def _go_parent(self, *_args):
         if self.remote_dir != "/sdcard":
@@ -2491,6 +3584,72 @@ class DroidDeskApplication(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.connect("activate", self._activate)
+        open_notification = Gio.SimpleAction.new(
+            "open-android-notification", GLib.VariantType.new("s")
+        )
+        open_notification.connect("activate", self._open_android_notification)
+        self.add_action(open_notification)
+        reply_notification = Gio.SimpleAction.new(
+            "reply-android-notification", GLib.VariantType.new("s")
+        )
+        reply_notification.connect("activate", self._reply_android_notification)
+        self.add_action(reply_notification)
+
+    def _open_android_notification(self, _action, target):
+        key = target.get_string() if target else ""
+        if not hasattr(self, "window"):
+            return
+        event = next(
+            (item for item in self.window.droidlink_messages if item.get("key") == key),
+            {},
+        )
+        page = "sms" if event.get("isSmsApp") else "droidlink"
+        self.window.stack.set_visible_child_name(page)
+        self.window.present()
+        if key:
+            self.window._send_droidlink_command("open", key)
+
+    def _reply_android_notification(self, _action, target):
+        if not hasattr(self, "window") or not target:
+            return
+        try:
+            details = json.loads(target.get_string())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        window = self.window
+        window.present()
+        dialog = Gtk.Dialog(
+            title="Répondre à la notification",
+            transient_for=window,
+            modal=True,
+        )
+        content = dialog.get_content_area()
+        content.set_margin_top(14)
+        content.set_margin_bottom(14)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Votre réponse")
+        entry.set_activates_default(True)
+        content.append(entry)
+        dialog.add_button("Annuler", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Envoyer", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+
+        def response(current, answer):
+            text = entry.get_text().strip()
+            current.destroy()
+            if answer == Gtk.ResponseType.ACCEPT and text:
+                window._send_droidlink_notification_action(
+                    details.get("key", ""),
+                    int(details.get("index", -1)),
+                    details.get("remoteInputKey", ""),
+                    text,
+                    details.get("title") or "Répondre",
+                )
+
+        dialog.connect("response", response)
+        dialog.present()
 
     def _activate(self, _application):
         if not hasattr(self, "window"):

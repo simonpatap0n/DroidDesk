@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">DroidLink</string>
+    <string name="notification_listener_name">DroidLink pour DroidDesk</string>
+    <string name="notification_listener_description">Transfère vers DroidDesk les notifications que vous autorisez, via la connexion ADB appairée.</string>
+</resources>

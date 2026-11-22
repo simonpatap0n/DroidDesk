@@ -9,6 +9,10 @@ install_data(
   install_mode: 'rwxr-xr-x',
 )
 install_data(
+  'src/droidlink_bridge.py',
+  install_dir: get_option('bindir'),
+)
+install_data(
   'data/' + app_id + '.desktop',
   install_dir: get_option('datadir') / 'applications',
 )
