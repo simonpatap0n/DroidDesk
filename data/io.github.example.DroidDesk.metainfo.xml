@@ -4,7 +4,7 @@
   <name>DroidDesk</name>
   <summary>Android, ADB, Bluetooth et scrcpy dans GNOME</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT</project_license>
+  <project_license>GPL-3.0-only</project_license>
   <description>
     <p>Une interface GTK4/libadwaita pour piloter un téléphone Android avec ADB, scrcpy et BlueZ.</p>
     <p>Gérer les appels, parcourir contacts et appels récents, contrôler le Bluetooth,

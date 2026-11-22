@@ -2483,7 +2483,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         about.set_version("0.3.0")
         about.set_developer_name("DroidDesk contributors")
         about.set_comments("Téléphone Android, scrcpy et transferts ADB depuis GNOME.")
-        about.set_license_type(Gtk.License.MIT_X11)
+        about.set_license_type(Gtk.License.GPL_3_0_ONLY)
         about.present()
 
 
