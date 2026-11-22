@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.example.DroidDesk</id>
+  <name>DroidDesk</name>
+  <summary>Android, ADB, Bluetooth et scrcpy dans GNOME</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Une interface GTK4/libadwaita pour piloter un téléphone Android avec ADB, scrcpy et BlueZ.</p>
+    <p>Gérer les appels, parcourir contacts et appels récents, contrôler le Bluetooth,
+       lancer des applications, transférer des fichiers et consulter l’état du téléphone.</p>
+  </description>
+  <launchable type="desktop-id">io.github.example.DroidDesk.desktop</launchable>
+  <provides>
+    <id>io.github.example.DroidDesk.desktop</id>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.3.0" date="2026-11-22">
+      <description><p>Liste d’applications avec actions clic droit, outils ADB étendus, appels plus explicites et composition SMS sur Android.</p></description>
+    </release>
+    <release version="0.2.0" date="2026-11-22">
+      <description><p>Intégration Bluetooth, détection du téléphone, contacts et interface d’applications par icônes.</p></description>
+    </release>
+    <release version="0.1.0" date="2026-11-22">
+      <description><p>Première version.</p></description>
+    </release>
+  </releases>
+</component>
