@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=DroidDesk
+GenericName=Téléphone Android
+Comment=Appels, SMS, Bluetooth, écran et fichiers Android depuis GNOME
+Exec=droiddesk
+TryExec=droiddesk
+Icon=io.github.example.DroidDesk
+Terminal=false
+StartupNotify=true
+Categories=GNOME;GTK;Utility;FileTools;
+Keywords=Android;ADB;scrcpy;Bluetooth;BlueZ;appel;SMS;téléphone;contacts;fichiers;applications;
