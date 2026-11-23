@@ -1,10 +1,15 @@
 package lol.patapon.droidlink
 
 import android.app.Notification
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.app.RemoteInput
-import android.content.Intent
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Telephony
 import java.net.HttpURLConnection
@@ -15,10 +20,56 @@ import org.json.JSONArray
 
 class NotificationRelayService : NotificationListenerService() {
     private val executor = Executors.newSingleThreadScheduledExecutor()
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            publishBatteryLevel()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        executor.scheduleWithFixedDelay(::pollCommands, 2, 3, java.util.concurrent.TimeUnit.SECONDS)
+        executor.scheduleWithFixedDelay(::pollCommands, 0, 1, java.util.concurrent.TimeUnit.SECONDS)
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(batteryReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(batteryReceiver, filter)
+        }
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(batteryReceiver) }
+        DroidLinkRinger.stop()
+        executor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun publishBatteryLevel() {
+        val level = getSystemService(BatteryManager::class.java)
+            ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            ?.takeIf { it in 0..100 } ?: return
+        val token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .getString(SESSION_TOKEN, null) ?: return
+        executor.execute {
+            val connection = (URL("http://localhost:$DROIDLINK_PORT/phone").openConnection() as HttpURLConnection)
+            try {
+                connection.requestMethod = "POST"
+                connection.connectTimeout = 2_000
+                connection.readTimeout = 2_000
+                connection.doOutput = true
+                connection.setRequestProperty("Authorization", "Bearer $token")
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                connection.outputStream.use {
+                    it.write(JSONObject().put("batteryPercent", level).toString().toByteArray(Charsets.UTF_8))
+                }
+                connection.responseCode
+            } catch (_: Exception) {
+                // The desktop may be offline; the next battery update will retry.
+            } finally {
+                connection.disconnect()
+            }
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -72,14 +123,22 @@ class NotificationRelayService : NotificationListenerService() {
             )
         }
         val actions = JSONArray()
+        val actionTitles = mutableListOf<String>()
         sbn.notification.actions?.forEachIndexed { index, action ->
             val remoteInput = action.remoteInputs?.firstOrNull()
+            val actionTitle = action.title?.toString().orEmpty().take(80)
+            actionTitles += actionTitle
             actions.put(
                 JSONObject()
                     .put("index", index)
-                    .put("title", action.title?.toString().orEmpty().take(80))
+                    .put("title", actionTitle)
                     .put("remoteInputKey", remoteInput?.resultKey.orEmpty().take(120)),
             )
+        }
+        val category = sbn.notification.category.orEmpty()
+        val hasAnswerAction = actionTitles.any { action ->
+            val normalized = action.lowercase()
+            listOf("answer", "répond", "repond", "décroch", "decroch", "accepter").any { normalized.contains(it) }
         }
 
         val event = JSONObject()
@@ -90,6 +149,9 @@ class NotificationRelayService : NotificationListenerService() {
             .put("isSmsApp", defaultSmsPackage != null && sbn.packageName == defaultSmsPackage)
             .put("conversationTitle", extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString().orEmpty().take(180))
             .put("isGroupConversation", extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION))
+            .put("category", category)
+            .put("ongoing", (sbn.notification.flags and Notification.FLAG_ONGOING_EVENT) != 0)
+            .put("isIncomingCall", category == Notification.CATEGORY_CALL && hasAnswerAction)
             .put("messages", recentMessages)
             .put("postedAt", sbn.postTime)
             .put("key", sbn.key)
@@ -136,6 +198,10 @@ class NotificationRelayService : NotificationListenerService() {
             connection.readTimeout = 2_500
             connection.setRequestProperty("Authorization", "Bearer $token")
             if (connection.responseCode !in 200..299) return
+            getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putLong("desktop_last_seen_ms", System.currentTimeMillis())
+                .apply()
             val response = connection.inputStream.bufferedReader().use { it.readText() }
             val commands = JSONObject(response).optJSONArray("commands") ?: JSONArray()
             for (index in 0 until commands.length()) {
@@ -152,32 +218,8 @@ class NotificationRelayService : NotificationListenerService() {
                         command.optString("text"),
                         command.optString("actionTitle"),
                     )
-                    "place_call" -> {
-                        val rawNumber = command.optString("number")
-                        val validNumber = rawNumber.matches(Regex("[+0-9*#() .-]{3,40}"))
-                        val placed = validNumber && DroidLinkTelecom.placeCall(
-                            this,
-                            rawNumber.filter { char -> char.isDigit() || char in "+*#" },
-                        )
-                        if (!placed) {
-                            val message = if (android.os.Build.VERSION.SDK_INT >= 23 &&
-                                checkSelfPermission(android.Manifest.permission.CALL_PHONE) != android.content.pm.PackageManager.PERMISSION_GRANTED
-                            ) {
-                                "Autorise les appels sortants dans DroidLink → Accès."
-                            } else {
-                                "Android n’a pas pu lancer l’appel. Vérifie que DroidLink est l’application Téléphone par défaut."
-                            }
-                            sendEvent(token, JSONObject().put("type", "call_command_error").put("action", "place_call").put("message", message).toString())
-                        }
-                    }
-                    "answer_call" -> DroidLinkTelecom.answer()
-                    "reject_call" -> DroidLinkTelecom.reject()
-                    "hangup_call" -> DroidLinkTelecom.hangUp()
-                    "call_audio_bluetooth" -> DroidLinkTelecom.setAudioRoute(android.telecom.CallAudioState.ROUTE_BLUETOOTH)
-                    "call_audio_speaker" -> DroidLinkTelecom.setAudioRoute(android.telecom.CallAudioState.ROUTE_SPEAKER)
-                    "call_audio_earpiece" -> DroidLinkTelecom.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
-                    "call_mute_on" -> DroidLinkTelecom.setMuted(true)
-                    "call_mute_off" -> DroidLinkTelecom.setMuted(false)
+                    "ring_phone" -> DroidLinkRinger.ring(this)
+                    "stop_phone_ring" -> DroidLinkRinger.stop()
                     "photo_list" -> DroidLinkMedia.sendRecentImages(this, token)
                     "photo_thumbnail" -> command.optLong("photoId", -1L)
                         .takeIf { it > 0L }
@@ -187,7 +229,6 @@ class NotificationRelayService : NotificationListenerService() {
                         token,
                         command.optJSONArray("packages") ?: JSONArray(),
                     )
-                    "call_log_list" -> DroidLinkCallLog.sendRecentCalls(this, token)
                 }
             }
         } catch (_: Exception) {
@@ -224,11 +265,6 @@ class NotificationRelayService : NotificationListenerService() {
         } catch (_: Exception) {
             // Android or the source app may have canceled the action.
         }
-    }
-
-    override fun onDestroy() {
-        executor.shutdownNow()
-        super.onDestroy()
     }
 
     companion object {

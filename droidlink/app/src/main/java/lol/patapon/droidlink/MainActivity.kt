@@ -7,6 +7,7 @@ import android.app.role.RoleManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Telephony
 import android.provider.Settings
 import android.provider.Settings.Secure
 import androidx.activity.ComponentActivity
@@ -32,7 +33,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.BatteryFull
-import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Notifications
@@ -40,6 +40,7 @@ import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -62,7 +63,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -89,31 +89,19 @@ private const val TOKEN_KEY = "session_token"
 private const val DROIDLINK_PORT = 17891
 
 class MainActivity : ComponentActivity() {
-    private var incomingDialNumber by mutableStateOf("")
-    private var phoneNavigationRequest by mutableIntStateOf(0)
-
-    companion object {
-        const val EXTRA_OPEN_PHONE = "lol.patapon.droidlink.OPEN_PHONE"
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        incomingDialNumber = intent?.data?.schemeSpecificPart.orEmpty()
-        if (intent?.getBooleanExtra(EXTRA_OPEN_PHONE, false) == true) phoneNavigationRequest += 1
-        setContent { DroidLinkTheme { DroidLinkApp(incomingDialNumber, phoneNavigationRequest) } }
+        setContent { DroidLinkTheme { DroidLinkApp() } }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        incomingDialNumber = intent.data?.schemeSpecificPart.orEmpty()
-        if (intent.getBooleanExtra(EXTRA_OPEN_PHONE, false)) phoneNavigationRequest += 1
     }
 }
 
 private enum class DroidLinkTab(val label: String, val icon: ImageVector) {
     Home("Accueil", Icons.Outlined.Home),
-    Phone("Appels", Icons.Outlined.Call),
     Notifications("Alertes", Icons.Outlined.Notifications),
     Settings("Accès", Icons.Outlined.Settings),
 }
@@ -122,7 +110,7 @@ private data class PairingResult(val token: String? = null, val error: String? =
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int) {
+private fun DroidLinkApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableStateOf(DroidLinkTab.Home) }
@@ -131,32 +119,33 @@ private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int)
     var pairingCode by rememberSaveable { mutableStateOf("") }
     var pairingStatus by rememberSaveable { mutableStateOf("") }
     var pairingBusy by remember { mutableStateOf(false) }
-    var dialerRole by remember { mutableStateOf(hasDialerRole(context)) }
     var mediaAccess by remember { mutableStateOf(DroidLinkMedia.hasAccess(context)) }
-    var callLogAccess by remember { mutableStateOf(DroidLinkCallLog.hasAccess(context)) }
-    var callPhoneAccess by remember { mutableStateOf(hasCallPhoneAccess(context)) }
-    var phoneNumber by rememberSaveable { mutableStateOf(initialDialNumber) }
-    val callState by DroidLinkTelecom.callState.collectAsState()
-
-    LaunchedEffect(initialDialNumber) {
-        if (initialDialNumber.isNotBlank()) {
-            phoneNumber = initialDialNumber
-            selectedTab = DroidLinkTab.Phone
-        }
-    }
-
-    LaunchedEffect(phoneNavigationRequest) {
-        if (phoneNavigationRequest > 0) selectedTab = DroidLinkTab.Phone
-    }
+    var defaultSmsApp by remember { mutableStateOf(isDefaultSmsApp(context)) }
+    val smsRoleAvailable = remember { isSmsRoleAvailable(context) }
 
     val settingsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
         notificationAccess = hasNotificationAccess(context)
-        dialerRole = hasDialerRole(context)
-        callLogAccess = DroidLinkCallLog.hasAccess(context)
-        callPhoneAccess = hasCallPhoneAccess(context)
         scope.launch { withContext(Dispatchers.IO) { publishPhoneCapabilities(context) } }
+    }
+
+    val smsRoleLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        defaultSmsApp = isDefaultSmsApp(context)
+    }
+    val requestSmsRole = {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            context.getSystemService(RoleManager::class.java)
+                ?.takeIf { it.isRoleAvailable(RoleManager.ROLE_SMS) }
+                ?.createRequestRoleIntent(RoleManager.ROLE_SMS)
+        } else {
+            @Suppress("DEPRECATION")
+            Intent(Telephony.Sms.Intents.ACTION_CHANGE_DEFAULT)
+                .putExtra(Telephony.Sms.Intents.EXTRA_PACKAGE_NAME, context.packageName)
+        }
+        if (intent != null) smsRoleLauncher.launch(intent)
     }
 
     val requestNotificationAccess = {
@@ -172,49 +161,6 @@ private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int)
         val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
         else Manifest.permission.READ_EXTERNAL_STORAGE
         if (!DroidLinkMedia.hasAccess(context)) mediaPermissionLauncher.launch(permission)
-    }
-
-    val callLogPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) {
-        callLogAccess = DroidLinkCallLog.hasAccess(context)
-        scope.launch { withContext(Dispatchers.IO) { publishPhoneCapabilities(context) } }
-    }
-    val requestCallLogAccess = {
-        if (!DroidLinkCallLog.hasAccess(context)) callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG)
-    }
-
-    val callPhonePermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) {
-        callPhoneAccess = hasCallPhoneAccess(context)
-        if (dialerRole && !DroidLinkCallLog.hasAccess(context)) {
-            callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG)
-        }
-        scope.launch { withContext(Dispatchers.IO) { publishPhoneCapabilities(context) } }
-    }
-    val requestCallPhoneAccess = {
-        if (!hasCallPhoneAccess(context)) callPhonePermissionLauncher.launch(Manifest.permission.CALL_PHONE)
-    }
-
-    val dialerRoleLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) {
-        dialerRole = hasDialerRole(context)
-        if (dialerRole && !hasCallPhoneAccess(context)) {
-            callPhonePermissionLauncher.launch(Manifest.permission.CALL_PHONE)
-        } else if (dialerRole && !DroidLinkCallLog.hasAccess(context)) {
-            callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG)
-        }
-        scope.launch { withContext(Dispatchers.IO) { publishPhoneCapabilities(context) } }
-    }
-    val requestDialerRole = {
-        val manager = if (Build.VERSION.SDK_INT >= 29) context.getSystemService(RoleManager::class.java) else null
-        if (manager != null && manager.isRoleAvailable(RoleManager.ROLE_DIALER)) {
-            dialerRoleLauncher.launch(manager.createRequestRoleIntent(RoleManager.ROLE_DIALER))
-        } else {
-            settingsLauncher.launch(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
-        }
     }
 
     val pairWithDesktop: (String) -> Unit = { code ->
@@ -236,7 +182,10 @@ private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int)
     val disconnect = {
         val token = sessionToken
         scope.launch(Dispatchers.IO) { if (token != null) requestUnpair(token) }
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(TOKEN_KEY).apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove(TOKEN_KEY)
+            .remove("desktop_last_seen_ms")
+            .apply()
         sessionToken = null
         pairingStatus = "DroidDesk a été dissocié."
     }
@@ -280,24 +229,6 @@ private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int)
                 onEnableNotifications = requestNotificationAccess,
                 onOpenPermissions = { selectedTab = DroidLinkTab.Settings },
             )
-            DroidLinkTab.Phone -> PhoneScreen(
-                modifier = Modifier.padding(padding),
-                number = phoneNumber,
-                call = callState,
-                dialerRole = dialerRole,
-                onNumberChange = { phoneNumber = it.filter { char -> char.isDigit() || char in "+*#" }.take(32) },
-                onRequestDialer = requestDialerRole,
-                onCall = {
-                    val number = phoneNumber.trim()
-                    if (dialerRole && DroidLinkTelecom.placeCall(context, number)) {
-                        phoneNumber = ""
-                    } else if (number.isNotBlank()) {
-                        context.startActivity(Intent(Intent.ACTION_DIAL, android.net.Uri.fromParts("tel", number, null)))
-                    }
-                },
-                onAnswer = { DroidLinkTelecom.answer() },
-                onHangUp = { DroidLinkTelecom.hangUp() },
-            )
             DroidLinkTab.Notifications -> NotificationsScreen(
                 modifier = Modifier.padding(padding),
                 paired = sessionToken != null,
@@ -309,81 +240,14 @@ private fun DroidLinkApp(initialDialNumber: String, phoneNavigationRequest: Int)
                 paired = sessionToken != null,
                 accessGranted = notificationAccess,
                 mediaAccess = mediaAccess,
-                callLogAccess = callLogAccess,
-                callPhoneAccess = callPhoneAccess,
-                dialerRole = dialerRole,
+                defaultSmsApp = defaultSmsApp,
+                smsRoleAvailable = smsRoleAvailable,
                 onEnable = requestNotificationAccess,
                 onDisconnect = disconnect,
-                onRequestDialer = requestDialerRole,
                 onRequestMediaAccess = requestMediaAccess,
-                onRequestCallLogAccess = requestCallLogAccess,
-                onRequestCallPhoneAccess = requestCallPhoneAccess,
+                onRequestSmsRole = requestSmsRole,
             )
         }
-    }
-}
-
-@Composable
-private fun PhoneScreen(
-    modifier: Modifier,
-    number: String,
-    call: DroidLinkCallState?,
-    dialerRole: Boolean,
-    onNumberChange: (String) -> Unit,
-    onRequestDialer: () -> Unit,
-    onCall: () -> Unit,
-    onAnswer: () -> Unit,
-    onHangUp: () -> Unit,
-) {
-    Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("Appels", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-        if (!dialerRole) {
-            FeatureCard(
-                Icons.Outlined.Call,
-                "Définir DroidLink comme application Téléphone",
-                "Autorise l’interface d’appel intégrée. Tu pourras remettre ton application actuelle dans les réglages Android.",
-                "Choisir",
-                onRequestDialer,
-            )
-        }
-        if (call != null) {
-            ElevatedCard(shape = RoundedCornerShape(24.dp)) {
-                Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(call.displayName.ifBlank { call.number.ifBlank { "Appel" } }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                    Text(call.number, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(callStateLabel(call.state), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (call.state == "RINGING") OutlinedButton(onClick = onAnswer) { Text("Répondre") }
-                        Button(onClick = onHangUp) { Text(if (call.state == "RINGING") "Refuser" else "Terminer") }
-                    }
-                }
-            }
-        }
-        OutlinedTextField(
-            value = number,
-            onValueChange = onNumberChange,
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("Numéro à composer") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-            singleLine = true,
-            shape = RoundedCornerShape(18.dp),
-        )
-        val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
-        keys.chunked(3).forEach { row ->
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                row.forEach { key ->
-                    OutlinedButton(onClick = { onNumberChange(number + key) }, modifier = Modifier.weight(1f)) {
-                        Text(key, style = MaterialTheme.typography.titleLarge)
-                    }
-                }
-            }
-        }
-        Button(onClick = onCall, enabled = number.isNotBlank(), modifier = Modifier.fillMaxWidth().height(54.dp), shape = RoundedCornerShape(18.dp)) {
-            Icon(Icons.Outlined.Call, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("Appeler avec la SIM du téléphone")
-        }
-        Text("L’audio passe par le profil mains libres Bluetooth si le téléphone est connecté à Debian comme casque.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -406,15 +270,15 @@ private fun HomeScreen(
         modifier = modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Votre téléphone, relié à GNOME.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-        Text("Un lien local par ADB pour les alertes, les appels et les photos dans DroidDesk.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Ton téléphone, relié à GNOME.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Text("DroidLink fait le lien avec DroidDesk. L’application Téléphone Android et la SIM restent celles du téléphone; les appels se lancent et se contrôlent depuis le PC.", color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         DeviceCard(context)
 
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Tuile DroidLink", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("Ajoute DroidLink aux Réglages rapides : balaie deux fois depuis le haut de l’écran, touche Modifier, puis fais glisser DroidLink dans les tuiles actives. Un toucher ouvre directement Appels.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Ajoute DroidLink aux Réglages rapides : balaie deux fois depuis le haut de l’écran, touche Modifier, puis fais glisser DroidLink dans les tuiles actives. La tuile ouvre les réglages de connexion du téléphone.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
@@ -517,7 +381,7 @@ private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGrant
                 Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Outlined.Notifications, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(36.dp))
                     Text("Les alertes arrivent dans GNOME", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                    Text("DroidLink relaie les notifications et garde le canal ADB local pour les commandes d’appel, les photos et les icônes d’applications.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("DroidLink relaie les notifications et garde le canal ADB local pour les photos et les icônes. DroidDesk contrôle les appels avec l’application Téléphone Android standard.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -531,19 +395,33 @@ private fun SettingsScreen(
     paired: Boolean,
     accessGranted: Boolean,
     mediaAccess: Boolean,
-    callLogAccess: Boolean,
-    callPhoneAccess: Boolean,
-    dialerRole: Boolean,
+    defaultSmsApp: Boolean,
+    smsRoleAvailable: Boolean,
     onEnable: () -> Unit,
     onDisconnect: () -> Unit,
-    onRequestDialer: () -> Unit,
     onRequestMediaAccess: () -> Unit,
-    onRequestCallLogAccess: () -> Unit,
-    onRequestCallPhoneAccess: () -> Unit,
+    onRequestSmsRole: () -> Unit,
 ) {
     val context = LocalContext.current
     var blockedApps by remember { mutableStateOf(readBlockedApps(context)) }
     var knownApps by remember { mutableStateOf(readKnownApps(context)) }
+    var showSmsRoleWarning by rememberSaveable { mutableStateOf(false) }
+    if (showSmsRoleWarning) {
+        AlertDialog(
+            onDismissRequest = { showSmsRoleWarning = false },
+            title = { Text("Changer l’application SMS par défaut ?") },
+            text = { Text("Android remettra les nouveaux SMS et MMS à DroidLink. DroidLink sait enregistrer les SMS, mais ne télécharge pas encore les pièces jointes MMS; le rôle SMS ne donne pas accès aux conversations RCS. Continue seulement si tu acceptes ces limites.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSmsRoleWarning = false
+                    onRequestSmsRole()
+                }) { Text("Continuer vers Android") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSmsRoleWarning = false }) { Text("Annuler") }
+            },
+        )
+    }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Accès et confidentialité", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
         FeatureCard(
@@ -561,32 +439,41 @@ private fun SettingsScreen(
             onClick = if (paired) onDisconnect else ({}),
         )
         FeatureCard(
-            icon = Icons.Outlined.Call,
-            title = "Application Téléphone",
-            subtitle = if (dialerRole) "DroidLink gère les appels" else "Requis pour répondre et terminer un appel depuis Debian",
-            action = if (dialerRole) "Activée" else "Choisir",
-            onClick = onRequestDialer,
+            icon = Icons.Outlined.PhoneAndroid,
+            title = "Rôle SMS Android",
+            subtitle = when {
+                defaultSmsApp -> "DroidLink est l’application SMS par défaut"
+                !smsRoleAvailable -> "Rôle SMS indisponible sur cet appareil"
+                else -> "À activer dans Android pour autoriser DroidLink à gérer les SMS"
+            },
+            action = when {
+                defaultSmsApp -> "Actif"
+                !smsRoleAvailable -> "Indisponible"
+                else -> "Demander"
+            },
+            onClick = if (!defaultSmsApp && smsRoleAvailable) ({ showSmsRoleWarning = true }) else ({}),
         )
+        Text(
+            "Le rôle fait de DroidLink l’application SMS par défaut. Android lui remet les SMS et MMS entrants; l’intégration MMS est encore limitée et RCS n’est pas accessible par ce rôle. Garde Google Messages par défaut si tu dépends des MMS/RCS.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ElevatedCard(shape = RoundedCornerShape(22.dp)) {
+            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.PhoneAndroid, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(14.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("Téléphone Android standard", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("DroidLink ne remplace pas le composeur. DroidDesk pilote les appels via ADB.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
         FeatureCard(
             icon = Icons.Outlined.PhoneAndroid,
             title = "Galerie du téléphone",
             subtitle = if (mediaAccess) "Accès aux photos autorisé" else "Autorise les images pour afficher les 2 000 plus récentes",
             action = if (mediaAccess) "Autorisé" else "Autoriser",
             onClick = onRequestMediaAccess,
-        )
-        FeatureCard(
-            icon = Icons.Outlined.Call,
-            title = "Historique des appels",
-            subtitle = if (callLogAccess) "Accès autorisé" else "DroidLink doit être l’application Téléphone pour demander cet accès",
-            action = if (callLogAccess) "Autorisé" else if (dialerRole) "Autoriser" else "Choisir Téléphone",
-            onClick = if (dialerRole) onRequestCallLogAccess else onRequestDialer,
-        )
-        FeatureCard(
-            icon = Icons.Outlined.Call,
-            title = "Appels sortants depuis le PC",
-            subtitle = if (callPhoneAccess) "Autorisation Android active" else "Requiert DroidLink comme Téléphone et l’autorisation d’appel",
-            action = if (callPhoneAccess) "Autorisé" else if (dialerRole) "Autoriser" else "Choisir Téléphone",
-            onClick = if (dialerRole) onRequestCallPhoneAccess else onRequestDialer,
         )
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -621,7 +508,7 @@ private fun SettingsScreen(
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Vos données restent sous votre contrôle", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("Le relais de notifications maintient le canal ADB local de commandes. Les photos et les appels demandent en plus leurs autorisations dédiées. Aucune connexion cloud n’est configurée.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Le relais de notifications garde le canal ADB local actif. La galerie demande son autorisation Android. Aucune connexion cloud n’est configurée.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(2.dp))
                 Text("DroidLink · GPL-3.0-only", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
             }
@@ -657,14 +544,10 @@ private fun StatusPill(label: String, color: Color) {
 private fun readToken(context: Context): String? =
     context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(TOKEN_KEY, null)
 
-private fun hasDialerRole(context: Context): Boolean = if (Build.VERSION.SDK_INT >= 29) {
-    context.getSystemService(RoleManager::class.java)?.isRoleHeld(RoleManager.ROLE_DIALER) == true
-} else {
-    context.getSystemService(android.telecom.TelecomManager::class.java)?.defaultDialerPackage == context.packageName
-}
-
-private fun hasCallPhoneAccess(context: Context): Boolean =
-    context.checkSelfPermission(Manifest.permission.CALL_PHONE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+private fun batteryPercent(context: Context): Int =
+    context.getSystemService(BatteryManager::class.java)
+        ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        ?.takeIf { it in 0..100 } ?: -1
 
 private const val BLOCKED_APPS_KEY = "blocked_notification_apps"
 private const val KNOWN_APPS_KEY = "known_notification_apps"
@@ -680,6 +563,21 @@ private fun hasNotificationAccess(context: Context): Boolean {
     return listeners.contains(context.packageName)
 }
 
+private fun isDefaultSmsApp(context: Context): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        context.getSystemService(RoleManager::class.java)
+            ?.isRoleHeld(RoleManager.ROLE_SMS) == true
+    } else {
+        @Suppress("DEPRECATION")
+        Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
+    }
+
+private fun isSmsRoleAvailable(context: Context): Boolean =
+    context.packageManager.hasSystemFeature("android.hardware.telephony") &&
+        (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            context.getSystemService(RoleManager::class.java)
+                ?.isRoleAvailable(RoleManager.ROLE_SMS) == true)
+
 private suspend fun requestPairing(context: Context, code: String): PairingResult = withContext(Dispatchers.IO) {
     val connection = (URL("http://localhost:$DROIDLINK_PORT/pair").openConnection() as HttpURLConnection)
     try {
@@ -693,10 +591,8 @@ private suspend fun requestPairing(context: Context, code: String): PairingResul
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .put("android", Build.VERSION.RELEASE)
-            .put("dialerRole", hasDialerRole(context))
             .put("notificationAccess", hasNotificationAccess(context))
-            .put("callLogAccess", DroidLinkCallLog.hasAccess(context))
-            .put("callPhoneAccess", hasCallPhoneAccess(context))
+            .put("batteryPercent", batteryPercent(context))
             .toString()
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         val status = connection.responseCode
@@ -748,10 +644,8 @@ private suspend fun publishPhoneCapabilities(context: Context) = withContext(Dis
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .put("android", Build.VERSION.RELEASE)
-            .put("dialerRole", hasDialerRole(context))
             .put("notificationAccess", hasNotificationAccess(context))
-            .put("callLogAccess", DroidLinkCallLog.hasAccess(context))
-            .put("callPhoneAccess", hasCallPhoneAccess(context))
+            .put("batteryPercent", batteryPercent(context))
             .toString()
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         connection.responseCode

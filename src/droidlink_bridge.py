@@ -1,16 +1,20 @@
 """Local HTTP bridge used by the DroidLink Android companion."""
 
 import json
+import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 PORT = 17891
 PAIRING_LIFETIME = 120
 MAX_BODY = 1_048_576
+SESSION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "droiddesk" / "droidlink-session.json"
 
 
 class DroidLinkBridge:
@@ -24,6 +28,7 @@ class DroidLinkBridge:
         self.code_expires = 0
         self.token = None
         self.phone = {}
+        self._load_saved_session()
         self.commands = []
         self.pair_attempts = 0
         self.server = None
@@ -55,6 +60,51 @@ class DroidLinkBridge:
             self.server.server_close()
             self.server = None
 
+    def _load_saved_session(self):
+        try:
+            saved = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+            token = saved.get("token") if isinstance(saved, dict) else None
+            phone = saved.get("phone", {}) if isinstance(saved, dict) else {}
+            if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+                return
+            if not isinstance(phone, dict):
+                phone = {}
+            self.token = token
+            self.phone = {
+                "manufacturer": str(phone.get("manufacturer", ""))[:80],
+                "model": str(phone.get("model", ""))[:100],
+                "android": str(phone.get("android", ""))[:40],
+                "notificationAccess": bool(phone.get("notificationAccess", False)),
+                "batteryPercent": self._bounded_int(phone.get("batteryPercent", -1), -1, 100),
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+    def _save_session_locked(self):
+        if not self.token:
+            try:
+                SESSION_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        temporary = None
+        try:
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(SESSION_FILE.parent, 0o700)
+            descriptor, temporary = tempfile.mkstemp(prefix=".droidlink-", dir=SESSION_FILE.parent)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump({"token": self.token, "phone": self.phone}, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, SESSION_FILE)
+        except OSError:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
     def begin_pairing(self):
         with self.lock:
             self.code = f"{secrets.randbelow(1_000_000):06d}"
@@ -63,6 +113,7 @@ class DroidLinkBridge:
             self.token = None
             self.phone = {}
             self.commands.clear()
+            self._save_session_locked()
             code = self.code
         self._changed()
         return code
@@ -79,6 +130,7 @@ class DroidLinkBridge:
             self.code_expires = 0
             self.token = None
             self.phone = {}
+            self._save_session_locked()
         self._changed()
 
     def snapshot(self):
@@ -98,7 +150,7 @@ class DroidLinkBridge:
             if not self.token:
                 return False
             command = {"action": action, "key": str(key)[:256]}
-            for field, limit in (("remoteInputKey", 120), ("text", 2_000), ("actionTitle", 80), ("number", 40)):
+            for field, limit in (("remoteInputKey", 120), ("text", 2_000), ("actionTitle", 80)):
                 if field in details:
                     command[field] = str(details[field])[:limit]
             if "packages" in details:
@@ -194,11 +246,10 @@ class DroidLinkBridge:
                         "manufacturer": str(payload.get("manufacturer", ""))[:80],
                         "model": str(payload.get("model", ""))[:100],
                         "android": str(payload.get("android", ""))[:40],
-                        "dialerRole": bool(payload.get("dialerRole", False)),
                         "notificationAccess": bool(payload.get("notificationAccess", False)),
-                        "callLogAccess": bool(payload.get("callLogAccess", False)),
-                        "callPhoneAccess": bool(payload.get("callPhoneAccess", False)),
+                        "batteryPercent": self._bounded_int(payload.get("batteryPercent", -1), -1, 100),
                     }
+                    self._save_session_locked()
                     accepted = True
             if not accepted:
                 self._respond(handler, 401, {"error": "Code incorrect ou expiré."})
@@ -239,28 +290,6 @@ class DroidLinkBridge:
                             "path": path,
                         })
                 event = {"type": event_type, "items": items}
-            elif event_type == "call_log_list":
-                items = []
-                source_items = payload.get("items", [])
-                if isinstance(source_items, list):
-                    for item in source_items[:100]:
-                        if isinstance(item, dict):
-                            items.append({
-                                "number": str(item.get("number", ""))[:40],
-                                "name": str(item.get("name", ""))[:120],
-                                "type": self._bounded_int(item.get("type", 0), 0, 10),
-                                "date": self._bounded_int(item.get("date", 0), 0, 2**63 - 1),
-                                "duration": self._bounded_int(item.get("duration", 0), 0, 2**63 - 1),
-                            })
-                event = {"type": event_type, "items": items}
-            elif event_type == "call_log_error":
-                event = {"type": event_type, "message": str(payload.get("message", ""))[:240]}
-            elif event_type == "call_command_error":
-                event = {
-                    "type": event_type,
-                    "action": str(payload.get("action", ""))[:32],
-                    "message": str(payload.get("message", ""))[:240],
-                }
             elif event_type in ("photo_thumbnail", "photo_thumbnail_error"):
                 image_id = self._bounded_int(payload.get("id", 0), 0, 2**63 - 1)
                 event = {"type": event_type, "id": image_id}
@@ -285,7 +314,7 @@ class DroidLinkBridge:
                         encoded = str(item.get("png", ""))
                         if not re.fullmatch(r"[A-Za-z0-9_.]+", package):
                             continue
-                        if len(encoded) > 48_000 or not all(char.isalnum() or char in "+/=-_" for char in encoded):
+                        if len(encoded) > 80_000 or not all(char.isalnum() or char in "+/=-_" for char in encoded):
                             continue
                         items.append({
                             "package": package,
@@ -320,6 +349,9 @@ class DroidLinkBridge:
                         "isSmsApp": bool(payload.get("isSmsApp", False)),
                         "conversationTitle": str(payload.get("conversationTitle", ""))[:180],
                         "isGroupConversation": bool(payload.get("isGroupConversation", False)),
+                        "category": str(payload.get("category", ""))[:40],
+                        "ongoing": bool(payload.get("ongoing", False)),
+                        "isIncomingCall": bool(payload.get("isIncomingCall", False)),
                         "postedAt": self._bounded_int(payload.get("postedAt", 0), 0, 2**63 - 1),
                         "actions": normalized_actions,
                     })
@@ -340,30 +372,15 @@ class DroidLinkBridge:
         elif handler.path == "/phone":
             with self.lock:
                 self.phone.update({
-                    "manufacturer": str(payload.get("manufacturer", ""))[:80],
-                    "model": str(payload.get("model", ""))[:100],
-                    "android": str(payload.get("android", ""))[:40],
-                    "dialerRole": bool(payload.get("dialerRole", False)),
+                    "manufacturer": str(payload.get("manufacturer", self.phone.get("manufacturer", "")))[:80],
+                    "model": str(payload.get("model", self.phone.get("model", "")))[:100],
+                    "android": str(payload.get("android", self.phone.get("android", "")))[:40],
                     "notificationAccess": bool(payload.get("notificationAccess", self.phone.get("notificationAccess", False))),
-                    "callLogAccess": bool(payload.get("callLogAccess", self.phone.get("callLogAccess", False))),
-                    "callPhoneAccess": bool(payload.get("callPhoneAccess", self.phone.get("callPhoneAccess", False))),
+                    "batteryPercent": self._bounded_int(payload.get("batteryPercent", self.phone.get("batteryPercent", -1)), -1, 100),
                 })
+                self._save_session_locked()
             self._respond(handler, 200, {"updated": True})
             self._changed()
-        elif handler.path == "/call":
-            event = {
-                "type": "call",
-                "state": str(payload.get("state", "IDLE"))[:24],
-                "number": str(payload.get("number", ""))[:40],
-                "displayName": str(payload.get("displayName", ""))[:120],
-                "audioRoute": str(payload.get("audioRoute", "none"))[:24],
-                "muted": bool(payload.get("muted", False)),
-                "supportedAudioRoutes": self._bounded_int(payload.get("supportedAudioRoutes", 0), 0, 255),
-            }
-            with self.lock:
-                self.phone["dialerRole"] = bool(payload.get("dialerRole", self.phone.get("dialerRole", False)))
-            self._respond(handler, 202, {"accepted": True})
-            self._event(event)
         elif handler.path == "/unpair":
             self.disconnect()
             self._respond(handler, 200, {"paired": False})

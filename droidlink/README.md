@@ -8,16 +8,16 @@ DroidLink est le compagnon Android de DroidDesk. Le bureau affiche un code à us
 - Détection du fabricant, du modèle, de la version Android et de la batterie.
 - Appairage par code à usage unique via `adb reverse`.
 - Relais des titres, textes et actions disponibles des notifications vers DroidDesk après autorisation explicite.
-- Réponse rapide ou action d’appel depuis DroidDesk quand l’application Android source fournit une action dans sa notification.
+- Affichage natif dans GNOME Shell; fermer une alerte dans le Shell la retire aussi du téléphone. DroidDesk conserve localement les 50 alertes récentes.
+- Réponse rapide depuis DroidDesk quand l’application Android source fournit cette action dans sa notification.
 - Filtre par application sur le téléphone; ouverture et rejet des notifications depuis le bureau.
 - Épinglage local des notifications dans DroidDesk.
-- Interface Téléphone par défaut, signalement des appels entrants/en cours, commandes répondre/refuser/terminer, sélection de route audio, micro et relais des 100 appels récents après autorisation.
 - Galerie MediaStore des 2 000 images récentes, avec autorisation Photos explicite et vignettes chargées à la demande.
 - Dissociation depuis le téléphone et retrait local du jeton.
 
-Le rôle Téléphone Android est requis pour l’interface d’appel intégrée. Pour transmettre le son au PC, connecte Debian au téléphone comme casque Bluetooth mains libres et choisis **Audio PC · Bluetooth** dans DroidDesk. La route dépend de ce que le téléphone expose pendant l’appel. La galerie demande l’autorisation Photos et transfère les vignettes par le tunnel ADB local.
+**DroidLink n’est pas l’application Téléphone.** L’application Téléphone Android habituelle reste par défaut. DroidDesk lance et contrôle les appels par ADB; le son passe par Bluetooth HFP/HSP lorsque le téléphone est connecté à Debian comme casque mains libres. La galerie demande l’autorisation Photos et transfère les vignettes par le tunnel ADB local.
 
-Les conversations et l’envoi SMS/MMS complets restent à intégrer. Android ne permet l’écriture et la réception complète dans le fournisseur SMS qu’à l’application SMS par défaut, laquelle doit aussi gérer la réception MMS. Les réponses de notification sont disponibles quand l’application source les expose. Consulte le tableau de livraison dans le [README de DroidDesk](../README.md#cible-phone-link).
+Les SMS existants sont lus directement par DroidDesk avec le fournisseur `content://sms` accessible à l’utilisateur `shell` d’ADB. DroidLink ne collecte ni ne conserve cet historique. Pour répondre, DroidDesk ouvre l’application Messages standard avec le numéro et le texte préremplis. Consulte le [README de DroidDesk](../README.md#cible-phone-link) pour les fonctionnalités et limites actuelles.
 
 DroidLink n’utilise aucun serveur cloud. Le serveur DroidDesk écoute seulement sur `localhost`; le téléphone le rejoint par le tunnel ADB appairé.
 
@@ -49,6 +49,6 @@ Le script `./build-apk.sh` vérifie Java et les composants Android avant de lanc
 2. Connecte le téléphone à DroidDesk et ouvre **DroidLink → Démarrer l’appairage**.
 3. Entre le code à six chiffres dans DroidLink.
 4. Dans DroidLink, autorise l’accès aux notifications pour les relayer et maintenir le canal de commandes.
-5. Dans **Accès**, autorise les images pour la galerie, choisis DroidLink comme application Téléphone, puis autorise l’historique d’appels.
+5. Dans **Accès**, autorise les images pour la galerie. Garde l’application Téléphone Android habituelle comme composeur par défaut.
 
 Le serveur local de DroidDesk et le transfert ADB sont nécessaires pour l’appairage. DroidLink est distribué sous GNU GPL-3.0-only.

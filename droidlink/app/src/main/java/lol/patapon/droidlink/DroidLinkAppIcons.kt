@@ -14,7 +14,9 @@ import java.net.URL
 
 object DroidLinkAppIcons {
     private const val PORT = 17891
-    private const val ICON_SIZE = 88
+    // Send launcher artwork at a size close to DroidDesk's rendered tile, so
+    // high-DPI desktops do not have to enlarge a tiny thumbnail.
+    private const val ICON_SIZE = 320
 
     fun sendIcons(context: Context, token: String, packages: JSONArray) {
         val items = JSONArray()
@@ -26,7 +28,7 @@ object DroidLinkAppIcons {
                 val application = packageManager.getApplicationInfo(packageName, 0)
                 val drawable = packageManager.getApplicationIcon(application)
                 val encoded = encode(drawable)
-                if (encoded.length <= 48_000) {
+                if (encoded.length <= 80_000) {
                     items.put(
                         JSONObject()
                             .put("package", packageName)
