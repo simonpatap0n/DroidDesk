@@ -2,6 +2,10 @@
 
 DroidDesk est une application GTK4/libadwaita pour gérer un téléphone Android depuis GNOME avec ADB, scrcpy et BlueZ.
 
+## Télécharger DroidDesk 0.1.0
+
+La première version publique est disponible dans les [releases GitHub](https://github.com/simonpatap0n/DroidDesk/releases/tag/v0.1.0), avec l’APK compagnon [DroidLink-0.1.0.apk](https://github.com/simonpatap0n/DroidDesk/releases/download/v0.1.0/DroidLink-0.1.0.apk).
+
 ## Fonctionnalités
 
 - **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC.

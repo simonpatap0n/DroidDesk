@@ -208,7 +208,7 @@ class NotificationRelayService : NotificationListenerService() {
                 val command = commands.optJSONObject(index) ?: continue
                 val key = command.optString("key")
                 when (command.optString("action")) {
-                    "dismiss" -> cancelNotification(key)
+                    "dismiss" -> dismissNotification(token, key)
                     "open" -> openNotification(key)
                     "snooze" -> if (android.os.Build.VERSION.SDK_INT >= 26) snoozeNotification(key, 60 * 60 * 1000L)
                     "notification_action" -> performNotificationAction(
@@ -236,6 +236,51 @@ class NotificationRelayService : NotificationListenerService() {
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun dismissNotification(token: String, key: String) {
+        if (key.isBlank()) {
+            reportCommandResult(token, "dismiss", key, false, "Clé de notification invalide.")
+            return
+        }
+
+        val activeBefore = runCatching {
+            getActiveNotifications().orEmpty().any { it.key == key }
+        }.getOrElse {
+            reportCommandResult(token, "dismiss", key, false, "Accès aux notifications Android indisponible.")
+            return
+        }
+        if (!activeBefore) {
+            reportCommandResult(token, "dismiss", key, true, "La notification était déjà absente.")
+            return
+        }
+
+        runCatching { cancelNotification(key) }.onFailure {
+            reportCommandResult(token, "dismiss", key, false, "Android a refusé la suppression de la notification.")
+            return
+        }
+
+        executor.schedule({
+            val stillActive = runCatching {
+                getActiveNotifications().orEmpty().any { it.key == key }
+            }.getOrElse { true }
+            if (stillActive) {
+                reportCommandResult(token, "dismiss", key, false, "La notification est toujours active sur le téléphone.")
+            } else {
+                reportCommandResult(token, "dismiss", key, true, "Notification supprimée sur Android.")
+            }
+        }, 700, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    private fun reportCommandResult(token: String, action: String, key: String, success: Boolean, message: String) {
+        val event = JSONObject()
+            .put("type", "command_result")
+            .put("action", action)
+            .put("key", key.take(256))
+            .put("success", success)
+            .put("message", message.take(200))
+            .toString()
+        sendEvent(token, event)
     }
 
     private fun openNotification(key: String) {

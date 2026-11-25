@@ -269,7 +269,15 @@ class DroidLinkBridge:
 
         if handler.path == "/events":
             event_type = str(payload.get("type", ""))[:32]
-            if event_type == "photo_list":
+            if event_type == "command_result":
+                event = {
+                    "type": event_type,
+                    "action": str(payload.get("action", ""))[:40],
+                    "key": str(payload.get("key", ""))[:256],
+                    "success": bool(payload.get("success", False)),
+                    "message": str(payload.get("message", ""))[:200],
+                }
+            elif event_type == "photo_list":
                 items = []
                 source_items = payload.get("items", [])
                 if isinstance(source_items, list):

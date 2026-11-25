@@ -16,14 +16,8 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.3.0" date="2026-11-22">
-      <description><p>Liste d’applications avec actions clic droit, outils ADB étendus, appels plus explicites et composition SMS sur Android.</p></description>
-    </release>
-    <release version="0.2.0" date="2026-11-22">
-      <description><p>Intégration Bluetooth, détection du téléphone, contacts et interface d’applications par icônes.</p></description>
-    </release>
-    <release version="0.1.0" date="2026-11-22">
-      <description><p>Première version.</p></description>
+    <release version="0.1.0" date="2026-11-24">
+      <description><p>Première version publique de DroidDesk : appels, contacts et journal, SMS, applications Android, écran scrcpy intégré, photos, fichiers, Bluetooth, ADB et notifications GNOME via DroidLink.</p></description>
     </release>
   </releases>
 </component>
