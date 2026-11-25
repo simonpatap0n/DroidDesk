@@ -1,0 +1,19 @@
+services:
+  droidlink-relay:
+    build: .
+    container_name: droidlink-relay
+    restart: unless-stopped
+    ports:
+      - "${DROIDLINK_BIND_ADDRESS:-0.0.0.0}:17892:8080"
+    volumes:
+      - droidlink_relay_data:/data
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+
+volumes:
+  droidlink_relay_data:

@@ -86,7 +86,6 @@ import java.net.URL
 
 private const val PREFS = "droidlink"
 private const val TOKEN_KEY = "session_token"
-private const val DROIDLINK_PORT = 17891
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,7 +105,7 @@ private enum class DroidLinkTab(val label: String, val icon: ImageVector) {
     Settings("Accès", Icons.Outlined.Settings),
 }
 
-private data class PairingResult(val token: String? = null, val error: String? = null)
+private data class PairingResult(val token: String? = null, val sessionId: String? = null, val error: String? = null)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -116,6 +115,7 @@ private fun DroidLinkApp() {
     var selectedTab by rememberSaveable { mutableStateOf(DroidLinkTab.Home) }
     var sessionToken by remember { mutableStateOf(readToken(context)) }
     var notificationAccess by remember { mutableStateOf(hasNotificationAccess(context)) }
+    var contactsAccess by remember { mutableStateOf(DroidLinkContacts.hasAccess(context)) }
     var pairingCode by rememberSaveable { mutableStateOf("") }
     var pairingStatus by rememberSaveable { mutableStateOf("") }
     var pairingBusy by remember { mutableStateOf(false) }
@@ -152,6 +152,17 @@ private fun DroidLinkApp() {
         settingsLauncher.launch(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
     }
 
+    val contactsPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        contactsAccess = DroidLinkContacts.hasAccess(context)
+    }
+    val requestContactsAccess = {
+        if (!DroidLinkContacts.hasAccess(context)) {
+            contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+        }
+    }
+
     val mediaPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) {
@@ -169,21 +180,24 @@ private fun DroidLinkApp() {
         scope.launch {
             val result = withContext(Dispatchers.IO) { requestPairing(context, code) }
             pairingBusy = false
-            if (result.token != null) {
+            if (result.token != null && result.sessionId != null) {
                 sessionToken = result.token
                 pairingCode = ""
                 pairingStatus = "DroidDesk est associé à ce téléphone."
             } else {
-                pairingStatus = result.error ?: "Connexion impossible. Vérifie le code et ADB."
+                pairingStatus = result.error ?: "Connexion impossible. Vérifie le code et l’accès HTTPS."
             }
         }
     }
 
     val disconnect = {
         val token = sessionToken
-        scope.launch(Dispatchers.IO) { if (token != null) requestUnpair(token) }
+        val sessionId = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(DroidLinkTransport.SESSION_ID_KEY, null)
+        scope.launch(Dispatchers.IO) { if (token != null && sessionId != null) requestUnpair(context, token, sessionId) }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove(TOKEN_KEY)
+            .remove(DroidLinkTransport.SESSION_ID_KEY)
             .remove("desktop_last_seen_ms")
             .apply()
         sessionToken = null
@@ -239,12 +253,14 @@ private fun DroidLinkApp() {
                 modifier = Modifier.padding(padding),
                 paired = sessionToken != null,
                 accessGranted = notificationAccess,
+                contactsAccess = contactsAccess,
                 mediaAccess = mediaAccess,
                 defaultSmsApp = defaultSmsApp,
                 smsRoleAvailable = smsRoleAvailable,
                 onEnable = requestNotificationAccess,
                 onDisconnect = disconnect,
                 onRequestMediaAccess = requestMediaAccess,
+                onRequestContactsAccess = requestContactsAccess,
                 onRequestSmsRole = requestSmsRole,
             )
         }
@@ -289,7 +305,7 @@ private fun HomeScreen(
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(if (paired) "DroidDesk est associé" else "Associer à DroidDesk", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                        Text(if (paired) "Connexion par le tunnel ADB" else "Démarre l’appairage sur le PC, puis saisis son code.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(if (paired) "Connexion HTTPS via DroidLink" else "Démarre l’association sur le PC, puis saisis son code.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
                 if (paired) {
@@ -329,7 +345,7 @@ private fun HomeScreen(
             action = if (notificationAccess) "Réglages" else "Autoriser",
             onClick = if (notificationAccess) onOpenPermissions else onEnableNotifications,
         )
-        Text("DroidLink ne transmet que les notifications autorisées par Android. Le téléphone et le PC doivent être appairés par ADB.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("DroidLink transmet les notifications autorisées par Android au moyen d’une connexion HTTPS. Les deux appareils peuvent être sur des réseaux différents.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -373,7 +389,7 @@ private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGrant
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Alertes", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
         if (!paired) {
-            FeatureCard(Icons.Outlined.Link, "Associer d’abord DroidDesk", "Le tunnel ADB doit être actif pour relayer les notifications.", "Accueil") { }
+            FeatureCard(Icons.Outlined.Link, "Associer d’abord DroidDesk", "Le relais HTTPS doit être configuré et joignable.", "Accueil") { }
         } else if (!accessGranted) {
             FeatureCard(Icons.Outlined.Security, "Autoriser l’accès aux notifications", "Android demande votre accord dans les réglages système.", "Autoriser", onEnable)
         } else {
@@ -381,11 +397,11 @@ private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGrant
                 Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Outlined.Notifications, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(36.dp))
                     Text("Les alertes arrivent dans GNOME", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                    Text("DroidLink relaie les notifications et garde le canal ADB local pour les photos et les icônes. DroidDesk contrôle les appels avec l’application Téléphone Android standard.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("DroidLink relaie les notifications, les photos et les icônes par HTTPS. DroidDesk garde l’application Téléphone Android standard.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
-        Text("Le contenu reste sur le téléphone si le tunnel ADB est fermé.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Les notifications restent sur le téléphone si le relais est indisponible.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -394,11 +410,13 @@ private fun SettingsScreen(
     modifier: Modifier,
     paired: Boolean,
     accessGranted: Boolean,
+    contactsAccess: Boolean,
     mediaAccess: Boolean,
     defaultSmsApp: Boolean,
     smsRoleAvailable: Boolean,
     onEnable: () -> Unit,
     onDisconnect: () -> Unit,
+    onRequestContactsAccess: () -> Unit,
     onRequestMediaAccess: () -> Unit,
     onRequestSmsRole: () -> Unit,
 ) {
@@ -434,9 +452,16 @@ private fun SettingsScreen(
         FeatureCard(
             icon = Icons.Outlined.Security,
             title = "Connexion",
-            subtitle = if (paired) "Appairé par ADB · aucun serveur public" else "Aucun ordinateur associé",
+            subtitle = if (paired) "Associé au relais HTTPS DroidLink" else "Aucun ordinateur associé",
             action = if (paired) "Dissocier" else "—",
             onClick = if (paired) onDisconnect else ({}),
+        )
+        FeatureCard(
+            icon = Icons.Outlined.PhoneAndroid,
+            title = "Contacts",
+            subtitle = if (contactsAccess) "Accès autorisé pour afficher les contacts dans DroidDesk" else "Autorise DroidLink à lire les contacts du téléphone",
+            action = if (contactsAccess) "Autorisé" else "Autoriser",
+            onClick = onRequestContactsAccess,
         )
         FeatureCard(
             icon = Icons.Outlined.PhoneAndroid,
@@ -464,7 +489,7 @@ private fun SettingsScreen(
                 Spacer(Modifier.width(14.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text("Téléphone Android standard", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("DroidLink ne remplace pas le composeur. DroidDesk pilote les appels via ADB.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("DroidLink ne remplace pas le composeur Android. Certaines commandes DroidDesk utilisent encore ADB pendant leur migration vers le compagnon.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -508,7 +533,7 @@ private fun SettingsScreen(
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Vos données restent sous votre contrôle", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("Le relais de notifications garde le canal ADB local actif. La galerie demande son autorisation Android. Aucune connexion cloud n’est configurée.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("DroidLink utilise le relais privé droidlink.patapon.lol. Les contenus des notifications et photos transitent par le serveur auto-hébergé; l’accès aux photos reste soumis à l’autorisation Android.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(2.dp))
                 Text("DroidLink · GPL-3.0-only", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
             }
@@ -541,8 +566,12 @@ private fun StatusPill(label: String, color: Color) {
     }
 }
 
-private fun readToken(context: Context): String? =
-    context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(TOKEN_KEY, null)
+private fun readToken(context: Context): String? {
+    val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    val sessionId = preferences.getString(DroidLinkTransport.SESSION_ID_KEY, null)
+    if (sessionId == null || !sessionId.matches(Regex("[A-Za-z0-9_-]{20,64}"))) return null
+    return preferences.getString(TOKEN_KEY, null)
+}
 
 private fun batteryPercent(context: Context): Int =
     context.getSystemService(BatteryManager::class.java)
@@ -579,52 +608,61 @@ private fun isSmsRoleAvailable(context: Context): Boolean =
                 ?.isRoleAvailable(RoleManager.ROLE_SMS) == true)
 
 private suspend fun requestPairing(context: Context, code: String): PairingResult = withContext(Dispatchers.IO) {
-    val connection = (URL("http://localhost:$DROIDLINK_PORT/pair").openConnection() as HttpURLConnection)
+    val connection = (URL("${DroidLinkTransport.DEFAULT_RELAY_URL}/v1/pair").openConnection() as HttpURLConnection)
     try {
         connection.requestMethod = "POST"
         connection.connectTimeout = 3_000
-        connection.readTimeout = 4_000
+        connection.readTimeout = 8_000
         connection.doOutput = true
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         val body = JSONObject()
             .put("code", code)
-            .put("manufacturer", Build.MANUFACTURER)
-            .put("model", Build.MODEL)
-            .put("android", Build.VERSION.RELEASE)
-            .put("notificationAccess", hasNotificationAccess(context))
-            .put("batteryPercent", batteryPercent(context))
+            .put("phone", JSONObject()
+                .put("manufacturer", Build.MANUFACTURER)
+                .put("model", Build.MODEL)
+                .put("android", Build.VERSION.RELEASE)
+                .put("notificationAccess", hasNotificationAccess(context))
+                .put("batteryPercent", batteryPercent(context)))
             .toString()
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         val status = connection.responseCode
         val stream = if (status in 200..299) connection.inputStream else connection.errorStream
         val response = stream?.bufferedReader()?.use { it.readText() }?.let(::JSONObject)
         val token = response?.optString("token")?.takeIf { it.isNotBlank() && it != "null" }
-        if (status in 200..299 && token != null) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(TOKEN_KEY, token).apply()
-            PairingResult(token = token)
+        val sessionId = response?.optString("sessionId")?.takeIf { it.isNotBlank() && it != "null" }
+        if (status in 200..299 && token != null && sessionId != null) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString(TOKEN_KEY, token)
+                .putString(DroidLinkTransport.SESSION_ID_KEY, sessionId)
+                .putString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
+                .apply()
+            PairingResult(token = token, sessionId = sessionId)
         } else {
             PairingResult(error = response?.optString("error")?.takeIf { it.isNotBlank() } ?: "Code refusé. Vérifie qu’il est encore valide.")
         }
     } catch (_: Exception) {
-        PairingResult(error = "DroidDesk est inaccessible. Vérifie ADB et le code d’appairage.")
+        PairingResult(error = "Relais DroidLink inaccessible. Vérifie le DNS, HTTPS et le code affiché sur le PC.")
     } finally {
         connection.disconnect()
     }
 }
 
-private suspend fun requestUnpair(token: String) = withContext(Dispatchers.IO) {
-    val connection = (URL("http://localhost:$DROIDLINK_PORT/unpair").openConnection() as HttpURLConnection)
+private suspend fun requestUnpair(context: Context, token: String, sessionId: String) = withContext(Dispatchers.IO) {
+    val baseUrl = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
+        ?.trimEnd('/') ?: DroidLinkTransport.DEFAULT_RELAY_URL
+    val connection = (URL("$baseUrl/v1/sessions/$sessionId/unpair").openConnection() as HttpURLConnection)
     try {
         connection.requestMethod = "POST"
-        connection.connectTimeout = 1_500
-        connection.readTimeout = 1_500
+        connection.connectTimeout = 3_000
+        connection.readTimeout = 5_000
         connection.doOutput = true
         connection.setRequestProperty("Authorization", "Bearer $token")
         connection.setRequestProperty("Content-Type", "application/json")
         connection.outputStream.use { it.write("{}".toByteArray()) }
         connection.responseCode
     } catch (_: Exception) {
-        // Clear local pairing even if the desktop is currently offline.
+        // Local credentials are still cleared if the relay is offline.
     } finally {
         connection.disconnect()
     }
@@ -632,28 +670,13 @@ private suspend fun requestUnpair(token: String) = withContext(Dispatchers.IO) {
 
 private suspend fun publishPhoneCapabilities(context: Context) = withContext(Dispatchers.IO) {
     val token = readToken(context) ?: return@withContext
-    val connection = (URL("http://localhost:$DROIDLINK_PORT/phone").openConnection() as HttpURLConnection)
-    try {
-        connection.requestMethod = "POST"
-        connection.connectTimeout = 2_000
-        connection.readTimeout = 2_000
-        connection.doOutput = true
-        connection.setRequestProperty("Authorization", "Bearer $token")
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        val body = JSONObject()
-            .put("manufacturer", Build.MANUFACTURER)
-            .put("model", Build.MODEL)
-            .put("android", Build.VERSION.RELEASE)
-            .put("notificationAccess", hasNotificationAccess(context))
-            .put("batteryPercent", batteryPercent(context))
-            .toString()
-        connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        connection.responseCode
-    } catch (_: Exception) {
-        // The desktop can refresh this state at the next pairing.
-    } finally {
-        connection.disconnect()
-    }
+    val body = JSONObject()
+        .put("manufacturer", Build.MANUFACTURER)
+        .put("model", Build.MODEL)
+        .put("android", Build.VERSION.RELEASE)
+        .put("notificationAccess", hasNotificationAccess(context))
+        .put("batteryPercent", batteryPercent(context))
+    DroidLinkTransport.post(context, token, "phone", body)
 }
 
 @Composable

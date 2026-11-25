@@ -12,14 +12,12 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Telephony
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.Executors
 import org.json.JSONObject
 import org.json.JSONArray
 
 class NotificationRelayService : NotificationListenerService() {
-    private val executor = Executors.newSingleThreadScheduledExecutor()
+    private val executor = Executors.newScheduledThreadPool(3)
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             publishBatteryLevel()
@@ -52,23 +50,7 @@ class NotificationRelayService : NotificationListenerService() {
         val token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getString(SESSION_TOKEN, null) ?: return
         executor.execute {
-            val connection = (URL("http://localhost:$DROIDLINK_PORT/phone").openConnection() as HttpURLConnection)
-            try {
-                connection.requestMethod = "POST"
-                connection.connectTimeout = 2_000
-                connection.readTimeout = 2_000
-                connection.doOutput = true
-                connection.setRequestProperty("Authorization", "Bearer $token")
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                connection.outputStream.use {
-                    it.write(JSONObject().put("batteryPercent", level).toString().toByteArray(Charsets.UTF_8))
-                }
-                connection.responseCode
-            } catch (_: Exception) {
-                // The desktop may be offline; the next battery update will retry.
-            } finally {
-                connection.disconnect()
-            }
+            DroidLinkTransport.post(this, token, "phone", JSONObject().put("batteryPercent", level))
         }
     }
 
@@ -169,41 +151,20 @@ class NotificationRelayService : NotificationListenerService() {
     }
 
     private fun sendEvent(token: String, body: String) {
-        val connection = (URL("http://localhost:$DROIDLINK_PORT/events")
-            .openConnection() as HttpURLConnection)
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 2_500
-            connection.readTimeout = 2_500
-            connection.doOutput = true
-            connection.setRequestProperty("Authorization", "Bearer $token")
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            if (connection.responseCode >= 400) connection.errorStream?.close()
-        } catch (_: Exception) {
-            // The desktop bridge may be closed; Android keeps the notification locally.
-        } finally {
-            connection.disconnect()
+        runCatching { JSONObject(body) }.getOrNull()?.let {
+            DroidLinkTransport.post(this, token, "events", it)
         }
     }
 
     private fun pollCommands() {
         val token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getString(SESSION_TOKEN, null) ?: return
-        val connection = (URL("http://localhost:$DROIDLINK_PORT/commands")
-            .openConnection() as HttpURLConnection)
         try {
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 2_500
-            connection.readTimeout = 2_500
-            connection.setRequestProperty("Authorization", "Bearer $token")
-            if (connection.responseCode !in 200..299) return
+            val commands = DroidLinkTransport.getCommands(this, token) ?: return
             getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                 .edit()
                 .putLong("desktop_last_seen_ms", System.currentTimeMillis())
                 .apply()
-            val response = connection.inputStream.bufferedReader().use { it.readText() }
-            val commands = JSONObject(response).optJSONArray("commands") ?: JSONArray()
             for (index in 0 until commands.length()) {
                 val command = commands.optJSONObject(index) ?: continue
                 val key = command.optString("key")
@@ -220,6 +181,7 @@ class NotificationRelayService : NotificationListenerService() {
                     )
                     "ring_phone" -> DroidLinkRinger.ring(this)
                     "stop_phone_ring" -> DroidLinkRinger.stop()
+                    "contacts_list" -> DroidLinkContacts.send(this, token)
                     "photo_list" -> DroidLinkMedia.sendRecentImages(this, token)
                     "photo_thumbnail" -> command.optLong("photoId", -1L)
                         .takeIf { it > 0L }
@@ -235,9 +197,7 @@ class NotificationRelayService : NotificationListenerService() {
                 }
             }
         } catch (_: Exception) {
-            // The ADB reverse tunnel may be temporarily unavailable.
-        } finally {
-            connection.disconnect()
+            // The relay may be temporarily unavailable; the next long poll retries.
         }
     }
 
@@ -320,6 +280,5 @@ class NotificationRelayService : NotificationListenerService() {
         private const val SESSION_TOKEN = "session_token"
         private const val KNOWN_APPS = "known_notification_apps"
         private const val BLOCKED_APPS = "blocked_notification_apps"
-        private const val DROIDLINK_PORT = 17891
     }
 }

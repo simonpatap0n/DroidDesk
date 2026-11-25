@@ -1,4 +1,4 @@
-"""Local HTTP bridge used by the DroidLink Android companion."""
+"""GNOME-side client for the self-hosted DroidLink HTTPS relay."""
 
 import hashlib
 import json
@@ -10,16 +10,19 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 PORT = 17891
 PAIRING_LIFETIME = 120
 MAX_BODY = 1_048_576
+RELAY_URL = "https://droidlink.patapon.lol"
 SESSION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "droiddesk" / "droidlink-session.json"
 
 
 class DroidLinkBridge:
-    """Receive a one-time pairing and notification events over adb reverse."""
+    """Relay DroidLink events and commands between GNOME and Android."""
 
     def __init__(self, on_change=None, on_event=None):
         self.on_change = on_change
@@ -28,10 +31,18 @@ class DroidLinkBridge:
         self.code = None
         self.code_expires = 0
         self.token = None
+        self.session_id = None
+        self.paired = False
+        self.phone_online = False
+        self.registered = False
+        self.relay_error = ""
+        self.relay_url = RELAY_URL
         self.phone = {}
-        self._load_saved_session()
         self.commands = []
         self.pair_attempts = 0
+        self.stop_event = threading.Event()
+        self.relay_wakeup = threading.Event()
+        self._load_saved_session()
         self.server = None
         self.thread = None
 
@@ -54,23 +65,45 @@ class DroidLinkBridge:
         self.server = LocalServer(("127.0.0.1", PORT), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+        self.relay_thread = threading.Thread(target=self._relay_loop, daemon=True)
+        self.relay_thread.start()
 
     def close(self):
+        self.stop_event.set()
+        self.relay_wakeup.set()
         if self.server:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
+        if getattr(self, "relay_thread", None):
+            self.relay_thread.join(timeout=2)
 
     def _load_saved_session(self):
         try:
             saved = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
-            token = saved.get("token") if isinstance(saved, dict) else None
+            token = saved.get("desktop_token") if isinstance(saved, dict) else None
+            session_id = saved.get("session_id") if isinstance(saved, dict) else None
             phone = saved.get("phone", {}) if isinstance(saved, dict) else {}
-            if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+            if (
+                not isinstance(token, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token)
+                or not isinstance(session_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", session_id)
+            ):
                 return
             if not isinstance(phone, dict):
                 phone = {}
             self.token = token
+            self.session_id = session_id
+            self.paired = bool(saved.get("paired", False))
+            self.phone_online = False
+            self.registered = bool(saved.get("registered", True))
+            pending_code = saved.get("code")
+            remaining = float(saved.get("code_expires_at", 0)) - time.time()
+            if isinstance(pending_code, str) and re.fullmatch(r"\d{6}", pending_code) and remaining > 0:
+                self.code = pending_code
+                self.code_expires = time.monotonic() + min(PAIRING_LIFETIME, remaining)
+            self.relay_url = str(saved.get("relay_url") or RELAY_URL).rstrip("/")
             self.phone = {
                 "manufacturer": str(phone.get("manufacturer", ""))[:80],
                 "model": str(phone.get("model", ""))[:100],
@@ -95,7 +128,16 @@ class DroidLinkBridge:
             descriptor, temporary = tempfile.mkstemp(prefix=".droidlink-", dir=SESSION_FILE.parent)
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump({"token": self.token, "phone": self.phone}, stream, ensure_ascii=False)
+                json.dump({
+                    "desktop_token": self.token,
+                    "session_id": self.session_id,
+                    "relay_url": self.relay_url,
+                    "paired": self.paired,
+                    "registered": self.registered,
+                    "code": self.code,
+                    "code_expires_at": time.time() + max(0, self.code_expires - time.monotonic()) if self.code else 0,
+                    "phone": self.phone,
+                }, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, SESSION_FILE)
@@ -107,31 +149,64 @@ class DroidLinkBridge:
                     pass
 
     def begin_pairing(self):
+        previous = None
         with self.lock:
+            if self.session_id and self.token:
+                previous = (self.relay_url, self.session_id, self.token)
             self.code = f"{secrets.randbelow(1_000_000):06d}"
             self.code_expires = time.monotonic() + PAIRING_LIFETIME
             self.pair_attempts = 0
-            self.token = None
+            self.token = secrets.token_urlsafe(32)
+            self.session_id = secrets.token_urlsafe(24)
+            self.paired = False
+            self.phone_online = False
+            self.registered = False
+            self.relay_error = ""
+            self.relay_url = RELAY_URL
             self.phone = {}
             self.commands.clear()
             self._save_session_locked()
             code = self.code
+        if previous:
+            threading.Thread(target=self._revoke_remote, args=previous, daemon=True).start()
+        self.relay_wakeup.set()
         self._changed()
         return code
 
     def cancel_pairing(self):
         with self.lock:
+            previous = (self.relay_url, self.session_id, self.token) if self.session_id and self.token else None
             self.code = None
             self.code_expires = 0
+            self.token = None
+            self.session_id = None
+            self.paired = False
+            self.phone_online = False
+            self.registered = False
+            self.relay_error = ""
+            self.phone = {}
+            self._save_session_locked()
+        if previous:
+            threading.Thread(target=self._revoke_remote, args=previous, daemon=True).start()
+        self.relay_wakeup.set()
         self._changed()
 
     def disconnect(self):
         with self.lock:
+            previous = (self.relay_url, self.session_id, self.token) if self.session_id and self.token else None
             self.code = None
             self.code_expires = 0
             self.token = None
+            self.session_id = None
+            self.paired = False
+            self.phone_online = False
+            self.registered = False
+            self.relay_error = ""
             self.phone = {}
             self._save_session_locked()
+        if previous:
+            threading.Thread(target=self._revoke_remote, args=previous, daemon=True).start()
+        self.relay_wakeup.set()
         self._changed()
 
     def snapshot(self):
@@ -139,18 +214,23 @@ class DroidLinkBridge:
             seconds = max(0, int(self.code_expires - time.monotonic())) if self.code else 0
             if self.code and seconds == 0:
                 self.code = None
-            cache_id = hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:24] if self.token else ""
+                self.relay_error = "Le code a expiré. Relance l’association."
+                self._save_session_locked()
+            cache_id = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:24] if self.session_id else ""
             return {
                 "code": self.code,
                 "seconds": seconds,
-                "paired": self.token is not None,
+                "paired": self.paired,
+                "registered": self.registered,
+                "online": self.paired and self.phone_online and not self.relay_error,
+                "relay_error": self.relay_error,
                 "cache_id": cache_id,
                 "phone": dict(self.phone),
             }
 
     def enqueue_command(self, action, key, **details):
         with self.lock:
-            if not self.token:
+            if not self.paired:
                 return False
             command = {"action": action, "key": str(key)[:256]}
             for field, limit in (("remoteInputKey", 120), ("text", 2_000), ("actionTitle", 80)):
@@ -177,7 +257,178 @@ class DroidLinkBridge:
                     return False
             self.commands.append(command)
             del self.commands[:-100]
+        self.relay_wakeup.set()
         return True
+
+    def _relay_request(self, method, path, payload=None, *, relay_url=None, token=None, timeout=8):
+        url = (relay_url or self.relay_url).rstrip("/") + path
+        headers = {"Accept": "application/json"}
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = Request(url, data=body, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read(MAX_BODY + 1)
+                if len(raw) > MAX_BODY:
+                    return response.status, {"error": "Réponse du relais trop volumineuse."}
+                return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+        except HTTPError as error:
+            try:
+                return error.code, json.loads(error.read(MAX_BODY).decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return error.code, {"error": "Le relais a refusé la requête."}
+        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as error:
+            return 0, {"error": str(error)[:240] or "Relais inaccessible."}
+
+    def _relay_loop(self):
+        while not self.stop_event.is_set():
+            with self.lock:
+                session_id, token = self.session_id, self.token
+                code = self.code
+                registered = self.registered
+                relay_url = self.relay_url
+            if not session_id or not token:
+                self.relay_wakeup.wait(1)
+                self.relay_wakeup.clear()
+                continue
+            if not registered:
+                if not code or time.monotonic() >= self.code_expires:
+                    with self.lock:
+                        if self.session_id == session_id and self.code:
+                            self.code = None
+                            self.relay_error = "Le code a expiré. Relance l’association."
+                            self._save_session_locked()
+                    self._changed()
+                    self.relay_wakeup.wait(2)
+                    self.relay_wakeup.clear()
+                    continue
+                status, response = self._relay_request(
+                    "POST",
+                    "/v1/sessions",
+                    {"sessionId": session_id, "desktopToken": token, "code": code or ""},
+                    relay_url=relay_url,
+                )
+                if status == 201:
+                    with self.lock:
+                        if self.session_id == session_id:
+                            self.registered = True
+                            self.relay_error = ""
+                            self._save_session_locked()
+                    self._changed()
+                    continue
+                with self.lock:
+                    if self.session_id == session_id:
+                        self.relay_error = str(response.get("error") or "Relais DroidLink inaccessible.")
+                        if status == 409 and code:
+                            self.code = f"{secrets.randbelow(1_000_000):06d}"
+                            self.code_expires = time.monotonic() + PAIRING_LIFETIME
+                            self.relay_error = ""
+                            self._save_session_locked()
+                        elif code and time.monotonic() >= self.code_expires:
+                            self.code = None
+                            self.relay_error = "Le code a expiré. Relance l’association."
+                self._changed()
+                self.relay_wakeup.wait(3)
+                self.relay_wakeup.clear()
+                continue
+
+            self._flush_remote_commands(session_id, token, relay_url)
+            status, response = self._relay_request(
+                "GET",
+                f"/v1/sessions/{session_id}/events?wait=2",
+                relay_url=relay_url,
+                token=token,
+                timeout=7,
+            )
+            if status == 200:
+                with self.lock:
+                    if self.session_id == session_id:
+                        new_paired = bool(response.get("paired", False))
+                        online = bool(response.get("online", False))
+                        changed = new_paired != self.paired or online != self.phone_online or response.get("phone", {}) != self.phone
+                        self.paired = new_paired
+                        self.phone_online = online
+                        self.phone = response.get("phone", {}) if isinstance(response.get("phone"), dict) else {}
+                        if self.paired:
+                            self.code = None
+                            self.code_expires = 0
+                        self.relay_error = ""
+                        if changed:
+                            self._save_session_locked()
+                    else:
+                        changed = False
+                if changed:
+                    self._changed()
+                for event in response.get("events", []) if isinstance(response.get("events"), list) else []:
+                    self._deliver_relay_event(session_id, token, event)
+                self._flush_remote_commands(session_id, token, relay_url)
+                continue
+            with self.lock:
+                if self.session_id == session_id:
+                    self.relay_error = str(response.get("error") or "Connexion au relais interrompue.")
+                    if status in (401, 404):
+                        self.paired = False
+                        self.phone_online = False
+                        self.registered = False
+                        self.code = None
+                        self.code_expires = 0
+                        self._save_session_locked()
+            self._changed()
+            if status in (401, 404):
+                self.relay_wakeup.wait(3)
+                self.relay_wakeup.clear()
+            else:
+                self.relay_wakeup.wait(2)
+                self.relay_wakeup.clear()
+
+    def _flush_remote_commands(self, session_id, token, relay_url):
+        while not self.stop_event.is_set():
+            with self.lock:
+                if self.session_id != session_id or not self.paired or not self.commands:
+                    return
+                command = self.commands[0]
+            status, _response = self._relay_request(
+                "POST",
+                f"/v1/sessions/{session_id}/commands",
+                command,
+                relay_url=relay_url,
+                token=token,
+            )
+            if status != 202:
+                return
+            with self.lock:
+                if self.commands and self.commands[0] == command:
+                    self.commands.pop(0)
+
+    def _deliver_relay_event(self, session_id, token, event):
+        if not isinstance(event, dict):
+            return
+        body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"http://127.0.0.1:{PORT}/events",
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=3) as response:
+                response.read(1024)
+        except (OSError, URLError, TimeoutError):
+            return
+
+    def _revoke_remote(self, relay_url, session_id, token):
+        self._relay_request(
+            "POST",
+            f"/v1/sessions/{session_id}/unpair",
+            {},
+            relay_url=relay_url,
+            token=token,
+            timeout=3,
+        )
 
     def _changed(self):
         if self.on_change:
@@ -334,6 +585,26 @@ class DroidLinkBridge:
                             "png": encoded,
                         })
                 event = {"type": event_type, "items": items}
+            elif event_type == "contacts_list":
+                items = []
+                source_items = payload.get("items", [])
+                if isinstance(source_items, list):
+                    for item in source_items[:5_000]:
+                        if not isinstance(item, dict):
+                            continue
+                        source_numbers = item.get("numbers", [])
+                        numbers = []
+                        if isinstance(source_numbers, list):
+                            numbers = [str(number)[:80] for number in source_numbers[:20] if str(number).strip()]
+                        if numbers:
+                            items.append({
+                                "id": str(item.get("id", ""))[:80],
+                                "name": str(item.get("name", "Contact sans nom"))[:160],
+                                "numbers": numbers,
+                            })
+                event = {"type": event_type, "items": items}
+            elif event_type == "contacts_error":
+                event = {"type": event_type, "message": str(payload.get("message", ""))[:240]}
             else:
                 event = {"key": str(payload.get("key", ""))[:256], "removed": bool(payload.get("removed", False))}
                 if not event["removed"]:

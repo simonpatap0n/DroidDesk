@@ -9,11 +9,8 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 object DroidLinkAppIcons {
-    private const val PORT = 17891
     // Send launcher artwork at a size close to DroidDesk's rendered tile, so
     // high-DPI desktops do not have to enlarge a tiny thumbnail.
     private const val ICON_SIZE = 320
@@ -38,7 +35,7 @@ object DroidLinkAppIcons {
                 }
             }
         }
-        post(token, JSONObject().put("type", "app_icons").put("items", items))
+        post(context, token, JSONObject().put("type", "app_icons").put("items", items))
     }
 
     private fun encode(drawable: Drawable): String {
@@ -59,21 +56,6 @@ object DroidLinkAppIcons {
         return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
     }
 
-    private fun post(token: String, payload: JSONObject) {
-        val connection = URL("http://localhost:$PORT/events").openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 3_000
-            connection.readTimeout = 4_000
-            connection.doOutput = true
-            connection.setRequestProperty("Authorization", "Bearer $token")
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            connection.responseCode
-        } catch (_: Exception) {
-            // DroidDesk can request the icon again after the local ADB tunnel returns.
-        } finally {
-            connection.disconnect()
-        }
-    }
+    private fun post(context: Context, token: String, payload: JSONObject) =
+        DroidLinkTransport.post(context, token, "events", payload)
 }

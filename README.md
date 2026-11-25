@@ -9,7 +9,7 @@ La première version publique est disponible dans les [releases GitHub](https://
 ## Fonctionnalités
 
 - **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC. L’enregistrement automatique optionnel capture la conversation en Opus quand DroidDesk détecte l’appel et relie HFP; les fichiers vont dans `Musique/DroidDesk Calls`.
-- **Contacts** et **Récents** : recherche, rappel et journal d’appels lus directement via ADB.
+- **Contacts** : lecture par DroidLink avec l’autorisation Android Contacts; ADB reste un mode de repli pendant la migration. **Récents** : journal d’appels encore lu via ADB.
 - **SMS** : lire les conversations et l’historique existants depuis la base SMS Android via ADB; préparer une réponse dans l’application Messages du téléphone.
 - **Écran et apps** : afficher scrcpy dans DroidDesk, parcourir les applications avec leurs vraies icônes Android, les ouvrir dans l’écran intégré, afficher leurs réglages ou les désinstaller avec le clic droit.
 - **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; ouvrir le stockage USB dans GNOME Files par MTP; afficher les 2 000 photos récentes, remplir le cache de petites vignettes puis améliorer la résolution des photos visibles.
@@ -71,7 +71,9 @@ droiddesk
 
 ## Compagnon Android DroidLink
 
-Le projet Android est dans [`droidlink/`](droidlink/README.md). Il fournit une interface Material 3, l’association au bureau par un code à usage unique, le relais de notifications, les photos, les icônes et les commandes distantes. DroidDesk ouvre son serveur uniquement sur `127.0.0.1`; le téléphone le rejoint avec `adb reverse`. Aucun service cloud n’est utilisé.
+Le projet Android est dans [`droidlink/`](droidlink/README.md). Il fournit une interface Material 3, l’association par code à usage unique, le relais HTTPS de notifications, photos, icônes et commandes. L'appairage DroidLink ne demande ni débogage USB ni options développeur. Les fonctions Android du bureau qui ne sont pas encore migrées vers le compagnon continuent de demander ADB.
+
+Le relais auto-hébergé et son déploiement Docker avec Nginx Proxy Manager sont documentés dans [`droidlink/relay/README.md`](droidlink/relay/README.md). Le domaine configuré dans les clients est `https://droidlink.patapon.lol`; le port privé du conteneur doit être accessible uniquement depuis NPM.
 
 Pour préparer l’APK, installe Java 17 ou plus récent, **Android SDK Platform 37** et **Android SDK Build-Tools 36.0.0** dans Android Studio (**Settings → Android SDK**), puis lance :
 
@@ -80,7 +82,7 @@ cd droidlink
 ./build-apk.sh
 ```
 
-Le Wrapper fourni télécharge Gradle 9.6.0 et les dépendances Gradle au premier build; Internet est requis à cette étape. `ANDROID_SDK_ROOT` peut indiquer l’emplacement du SDK si le script ne le détecte pas automatiquement. L’APK de débogage se trouve dans `droidlink/app/build/outputs/apk/debug/app-debug.apk`. Installe-le avec Android Studio ou `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
+Le Wrapper fourni télécharge Gradle 9.6.0 et les dépendances Gradle au premier build; Internet est requis à cette étape. `ANDROID_SDK_ROOT` peut indiquer l’emplacement du SDK si le script ne le détecte pas automatiquement. L’APK se trouve dans `droidlink/app/build/outputs/apk/debug/app-debug.apk`; transfère-le sur Android et ouvre-le pour l’installer. ADB reste une option d’installation pour le développement, pas une exigence d’installation ou d’utilisation de DroidLink.
 
 ## Appels, écran et SMS
 

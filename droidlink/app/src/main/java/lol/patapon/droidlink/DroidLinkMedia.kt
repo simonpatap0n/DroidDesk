@@ -11,11 +11,8 @@ import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 object DroidLinkMedia {
-    private const val PORT = 17891
     private const val MAX_RECENT_IMAGES = 2_000
 
     fun hasAccess(context: Context): Boolean {
@@ -30,7 +27,7 @@ object DroidLinkMedia {
 
     fun sendRecentImages(context: Context, token: String) {
         if (!hasAccess(context)) {
-            post(token, JSONObject().put("type", "photo_error").put("message", "Autorise l’accès aux photos dans DroidLink → Accès."))
+            post(context, token, JSONObject().put("type", "photo_error").put("message", "Autorise l’accès aux photos dans DroidLink → Accès."))
             return
         }
         val rows = JSONArray()
@@ -86,10 +83,10 @@ object DroidLinkMedia {
                 }
             }
         }.onFailure {
-            post(token, JSONObject().put("type", "photo_error").put("message", it.message.orEmpty().take(240)))
+            post(context, token, JSONObject().put("type", "photo_error").put("message", it.message.orEmpty().take(240)))
             return
         }
-        post(token, JSONObject().put("type", "photo_list").put("items", rows).put("count", rows.length()))
+        post(context, token, JSONObject().put("type", "photo_list").put("items", rows).put("count", rows.length()))
     }
 
     fun sendThumbnail(context: Context, token: String, id: Long) {
@@ -102,7 +99,7 @@ object DroidLinkMedia {
 
     private fun sendImage(context: Context, token: String, id: Long, preview: Boolean) {
         if (!hasAccess(context)) {
-            post(token, JSONObject().put("type", "photo_error").put("message", "Autorise l’accès aux photos dans DroidLink → Accès."))
+            post(context, token, JSONObject().put("type", "photo_error").put("message", "Autorise l’accès aux photos dans DroidLink → Accès."))
             return
         }
         runCatching {
@@ -132,6 +129,7 @@ object DroidLinkMedia {
             if (output.size() > maxBytes) error("Aperçu trop volumineux")
             val eventType = if (preview) "photo_preview" else "photo_thumbnail"
             post(
+                context,
                 token,
                 JSONObject()
                     .put("type", eventType)
@@ -140,25 +138,10 @@ object DroidLinkMedia {
             )
         }.onFailure {
             val eventType = if (preview) "photo_preview_error" else "photo_thumbnail_error"
-            post(token, JSONObject().put("type", eventType).put("id", id).put("message", it.message.orEmpty().take(200)))
+            post(context, token, JSONObject().put("type", eventType).put("id", id).put("message", it.message.orEmpty().take(200)))
         }
     }
 
-    private fun post(token: String, payload: JSONObject) {
-        val connection = URL("http://localhost:$PORT/events").openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 8_000
-            connection.readTimeout = 8_000
-            connection.doOutput = true
-            connection.setRequestProperty("Authorization", "Bearer $token")
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            connection.responseCode
-        } catch (_: Exception) {
-            // The phone keeps its gallery even when DroidDesk is offline.
-        } finally {
-            connection.disconnect()
-        }
-    }
+    private fun post(context: Context, token: String, payload: JSONObject) =
+        DroidLinkTransport.post(context, token, "events", payload, timeoutMs = 20_000)
 }

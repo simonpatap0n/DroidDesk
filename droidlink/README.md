@@ -1,54 +1,41 @@
 # DroidLink
 
-DroidLink est le compagnon Android de DroidDesk. Le bureau affiche un code à usage unique, puis le téléphone se relie par le tunnel ADB local. L’accès aux notifications maintient aussi le canal de commandes utilisé par les fonctions du bureau.
+DroidLink est le compagnon Android de DroidDesk. Il relaie les notifications, les commandes, la batterie, les photos récentes et les icônes d'applications à travers un relais HTTPS auto-hébergé. Le téléphone et le PC ouvrent chacun une connexion sortante; ils peuvent se trouver sur des réseaux différents.
 
-## Fonctions
+## Relais public
 
-- Interface Compose Material 3 avec couleurs dynamiques Android.
-- Détection du fabricant, du modèle, de la version Android et de la batterie.
-- Appairage par code à usage unique via `adb reverse`.
-- Relais des titres, textes et actions disponibles des notifications vers DroidDesk après autorisation explicite.
-- Affichage natif dans GNOME Shell; fermer une alerte dans le Shell la retire aussi du téléphone. DroidDesk conserve localement les 50 alertes récentes.
-- Réponse rapide depuis DroidDesk quand l’application Android source fournit cette action dans sa notification.
-- Filtre par application sur le téléphone; ouverture et rejet des notifications depuis le bureau.
-- Épinglage local des notifications dans DroidDesk.
-- Galerie MediaStore des 2 000 images récentes, avec autorisation Photos explicite et vignettes chargées à la demande.
-- Dissociation depuis le téléphone et retrait local du jeton.
+L'instance prévue pour DroidDesk est `https://droidlink.patapon.lol`. Le serveur Docker et les règles Nginx Proxy Manager sont dans [`relay/`](relay/README.md). Docker et NPM sont sur des machines/sites distincts : un VPN privé ou une route privée doit permettre à NPM d'atteindre le port 17892 de Docker. Le domaine public pointe vers NPM; le port du relais Docker ne s'ouvre pas sur Internet.
 
-**DroidLink n’est pas l’application Téléphone.** L’application Téléphone Android habituelle reste par défaut. DroidDesk lance et contrôle les appels par ADB; le son passe par Bluetooth HFP/HSP lorsque le téléphone est connecté à Debian comme casque mains libres. La galerie demande l’autorisation Photos et transfère les vignettes par le tunnel ADB local.
+Le relais conserve les jetons hachés et les informations d'état du téléphone dans SQLite. Les événements, photos et commandes ne sont conservés qu'en mémoire pour les transférer. Le relais et l'administrateur NPM voient le contenu en transit; l'hébergement doit rester sur un serveur de confiance.
 
-Les SMS existants sont lus directement par DroidDesk avec le fournisseur `content://sms` accessible à l’utilisateur `shell` d’ADB. DroidLink ne collecte ni ne conserve cet historique. Pour répondre, DroidDesk ouvre l’application Messages standard avec le numéro et le texte préremplis. Consulte le [README de DroidDesk](../README.md#cible-phone-link) pour les fonctionnalités et limites actuelles.
+## Fonctions de l'app compagnon
 
-DroidLink n’utilise aucun serveur cloud. Le serveur DroidDesk écoute seulement sur `localhost`; le téléphone le rejoint par le tunnel ADB appairé.
+- Association par code temporaire à six chiffres, sans débogage USB ou options développeur.
+- Relais des notifications après accord explicite d'Android, actions de notification et réponses rapides.
+- Synchronisation de la batterie et sonnerie distante.
+- Lecture des contacts après autorisation Android.
+- Galerie MediaStore des 2 000 images récentes, avec vignettes et aperçus chargés à la demande.
+- Envoi d'icônes d'applications Android.
+- Accès photos et rôle SMS demandés dans Android lorsque l'utilisateur choisit ces fonctions.
+
+Le composeur Android habituel reste celui du téléphone. La voix des appels exige le profil Bluetooth mains libres entre le téléphone et le PC. Le relais Internet ne transporte pas l'audio cellulaire. Les fonctions DroidDesk de contacts, journal, SMS, fichiers, contrôle d'écran et commandes d'appel sont encore en migration depuis ADB; l'association DroidLink elle-même ne le requiert plus.
 
 ## Compiler
 
-Il faut Java (JDK) 17 ou plus récent, Android SDK Platform 37 et Android SDK Build-Tools 36.0.0. Android Studio permet d’installer les deux composants dans **Settings → Android SDK → SDK Platforms / SDK Tools**. Le script détecte les SDK dans `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `~/Android/Sdk` ou `/usr/lib/android-sdk`.
+Il faut Java (JDK) 17 ou plus récent, Android SDK Platform 37 et Android SDK Build-Tools 36.0.0. Android Studio permet d'installer les deux composants dans **Settings → Android SDK → SDK Platforms / SDK Tools**. Le script détecte les SDK dans `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `~/Android/Sdk` ou `/usr/lib/android-sdk`.
 
 ```sh
 ./build-apk.sh
 ```
 
-Le Wrapper téléchargera automatiquement Gradle 9.6.0 et le projet téléchargera ses dépendances lors du premier build; une connexion Internet est donc nécessaire la première fois. Pour lancer la compilation directement :
-
-```sh
-./gradlew assembleDebug
-```
-
-L’APK de débogage sera créé ici : `app/build/outputs/apk/debug/app-debug.apk`. Pour l’installer sur un téléphone autorisé dans ADB :
-
-```sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-Le script `./build-apk.sh` vérifie Java et les composants Android avant de lancer Gradle et affiche l’emplacement de l’APK. Pour changer le SDK détecté automatiquement, définis `ANDROID_SDK_ROOT`.
+Le Wrapper téléchargera automatiquement Gradle 9.6.0 et les dépendances Gradle au premier build; une connexion Internet est nécessaire la première fois. L'APK sera créé ici : `app/build/outputs/apk/debug/app-debug.apk`. Transfère-le sur Android et ouvre-le pour l'installer; le fonctionnement de DroidLink ne demande pas ADB après l'installation.
 
 ## Installation et appairage
 
-1. Installe l’APK DroidLink et active le débogage USB ou ADB sans fil sur le téléphone.
-2. Connecte le téléphone à DroidDesk et ouvre **DroidLink → Démarrer l’appairage**.
-3. Entre le code à six chiffres dans DroidLink.
-4. Dans DroidLink, autorise l’accès aux notifications pour les relayer et maintenir le canal de commandes.
-5. Dans **Accès**, autorise les images pour la galerie. Garde l’application Téléphone Android habituelle comme composeur par défaut.
+1. Déploie le relais Docker et configure `https://droidlink.patapon.lol` dans NPM.
+2. Installe l'APK DroidLink comme une application Android ordinaire.
+3. Dans DroidDesk, ouvre **DroidLink → Démarrer l'appairage**.
+4. Entre le code affiché dans DroidLink.
+5. Autorise l'accès aux notifications dans les réglages Android; autorise les photos si tu veux la galerie.
 
-Le serveur local de DroidDesk et le transfert ADB sont nécessaires pour l’appairage. DroidLink est distribué sous GNU GPL-3.0-only.
+DroidLink est distribué sous GNU GPL-3.0-only.

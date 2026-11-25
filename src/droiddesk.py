@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import gi
-from droidlink_bridge import PORT, DroidLinkBridge
+from droidlink_bridge import DroidLinkBridge
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -668,6 +668,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.device_profiles = {}
         self.contacts = []
         self.contacts_loaded = False
+        self.contacts_relay_request_session = ""
         self.contacts_display_limit = 100
         self.contacts_search_source = 0
         self.sms_waiting_for_contacts = False
@@ -716,7 +717,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.bt_disabled_usb_devices = self._load_bt_disabled_usb_devices()
         self.bt_system_action_busy = False
         self.droidlink_pinned, self.droidlink_messages = self._load_droidlink_pins()
-        self._droidlink_tunnel_serial = None
         self.incoming_call_notification_key = None
         self.active_call_notification_key = None
         self.call_audio_module_ids = []
@@ -1119,7 +1119,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         pairing = Adw.PreferencesGroup.new()
         pairing.set_title("Téléphone compagnon")
-        pairing.set_description("Le code est à usage unique et expire après deux minutes.")
+        pairing.set_description("Relais HTTPS : droidlink.patapon.lol. Code à usage unique, valide deux minutes.")
         self.droidlink_status = Gtk.Label(label="Aucun téléphone DroidLink associé.", xalign=0)
         self.droidlink_status.set_wrap(True)
         self.droidlink_status.add_css_class("dim-label")
@@ -1134,7 +1134,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.droidlink_code_label.set_selectable(True)
         code_row = Adw.ActionRow.new()
         code_row.set_title("Code d’association")
-        code_row.set_subtitle("Saisis-le dans l’application DroidLink sur Android.")
+        code_row.set_subtitle("Saisis-le dans DroidLink sur Android. Les appareils peuvent être sur des réseaux différents.")
         code_row.add_suffix(self.droidlink_code_label)
         pairing.add(code_row)
 
@@ -1143,7 +1143,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.droidlink_pair_button.add_css_class("suggested-action")
         self.droidlink_pair_button.connect("clicked", self._start_droidlink_pairing)
         actions.append(self.droidlink_pair_button)
-        self.droidlink_disconnect_button = Gtk.Button(label="Dissocier / retirer le tunnel")
+        self.droidlink_disconnect_button = Gtk.Button(label="Dissocier le téléphone")
         self.droidlink_disconnect_button.connect("clicked", self._disconnect_droidlink)
         actions.append(self.droidlink_disconnect_button)
         page.append(pairing)
@@ -2851,77 +2851,18 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _start_droidlink_pairing(self, *_args):
         if not self.droidlink_bridge:
-            self._set_status("Le serveur local DroidLink n’a pas pu démarrer.", True)
-            return
-        active = self._active_device()
-        if not active:
-            self._set_status("Connectez et sélectionnez le téléphone Android avant l’appairage.", True)
+            self._set_status("Le client DroidLink n’a pas pu démarrer.", True)
             return
         code = self.droidlink_bridge.begin_pairing()
         self.droidlink_code_label.set_text(f"{code[:3]} {code[3:]}")
-        self._run_adb_command(
-            ["reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
-            "Ouverture du tunnel ADB local pour DroidLink…",
-            self._droidlink_reverse_result,
-        )
-
-    def _droidlink_reverse_result(self, result, error):
-        if error or not result or result.returncode != 0:
-            if self.droidlink_bridge:
-                self.droidlink_bridge.cancel_pairing()
-            detail = error or ((result.stderr or result.stdout).strip() if result else "")
-            self.droidlink_code_label.set_text("—")
-            self._set_status(f"Impossible d’ouvrir le tunnel ADB DroidLink : {detail}", True)
-            return
-        active = self._active_device()
-        self._droidlink_tunnel_serial = active[0] if active else None
-        self._set_status("Tunnel ADB prêt. Ouvrez DroidLink sur Android et saisissez le code affiché.")
+        self._set_status("Enregistrement de l’association auprès du relais HTTPS…")
         self._droidlink_state_changed()
 
-    def _ensure_droidlink_tunnel(self):
-        active = self._active_device()
-        if not active or not self.droidlink_bridge:
-            return
-        if not self.droidlink_bridge.snapshot()["paired"]:
-            return
-        serial = active[0]
-        if serial == self._droidlink_tunnel_serial:
-            return
-        self._run_adb_command(
-            ["reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
-                "Rétablissement automatique du lien DroidLink…",
-            lambda result, error, device=serial: self._restored_droidlink_tunnel(device, result, error),
-        )
-
-    def _restored_droidlink_tunnel(self, serial, result, error):
-        if error or not result or result.returncode != 0:
-            detail = error or ((result.stderr or result.stdout).strip() if result else "")
-            self._set_status(f"Le lien DroidLink n’a pas pu être rétabli : {detail}", True)
-            return
-        if self._active_device() and self._active_device()[0] == serial:
-            self._droidlink_tunnel_serial = serial
-            self._set_status("Lien DroidLink prêt pour les notifications et les fonctions du compagnon.")
-
     def _disconnect_droidlink(self, *_args):
-        self._droidlink_tunnel_serial = None
         if self.droidlink_bridge:
             self.droidlink_bridge.disconnect()
         self.droidlink_code_label.set_text("—")
-        if self._active_device():
-            self._run_adb_command(
-                ["reverse", "--remove", f"tcp:{PORT}"],
-                "Dissociation de DroidLink et retrait du tunnel ADB…",
-                self._droidlink_reverse_removed,
-            )
-        else:
-            self._set_status("DroidLink dissocié. Le tunnel sera retiré à la prochaine connexion ADB.")
-
-    def _droidlink_reverse_removed(self, result, error):
-        if error or not result or result.returncode != 0:
-            detail = error or ((result.stderr or result.stdout).strip() if result else "")
-            self._set_status(f"DroidLink est dissocié; retrait du tunnel ADB impossible : {detail}", True)
-        else:
-            self._set_status("DroidLink dissocié et tunnel ADB retiré.")
+        self._set_status("DroidLink dissocié du relais HTTPS.")
 
     def _droidlink_timer_tick(self):
         if not getattr(self, "droidlink_bridge", None):
@@ -2953,18 +2894,27 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             relay_ready = phone.get("notificationAccess")
             dialer = " · relais de notifications actif" if relay_ready else ""
             needs_access = " · active les notifications dans DroidLink" if not phone.get("notificationAccess") else ""
-            self.droidlink_status.set_text(f"Associé · {name or 'Téléphone Android'} · Android {phone.get('android') or '—'}{dialer}{needs_access}")
+            link_state = "en ligne" if state.get("online") else "hors ligne"
+            relay_error = f" · {state['relay_error']}" if state.get("relay_error") else ""
+            self.droidlink_status.set_text(f"Associé · {name or 'Téléphone Android'} · Android {phone.get('android') or '—'} · {link_state}{dialer}{needs_access}{relay_error}")
             self.droidlink_code_label.set_text("—")
             battery = phone.get("batteryPercent", -1)
             self.phone_battery_label.set_text(f"Batterie · {battery}%" if isinstance(battery, int) and 0 <= battery <= 100 else "")
             self.phone_battery_label.set_visible(isinstance(battery, int) and 0 <= battery <= 100)
+            if self.stack.get_visible_child_name() == "contacts" and not self.contacts_loaded:
+                self._refresh_contacts()
         elif state["code"]:
-            self.droidlink_status.set_text(f"En attente du téléphone · code valide encore {state['seconds']} s.")
+            if state.get("relay_error"):
+                self.droidlink_status.set_text(f"Relais : {state['relay_error']}")
+            elif not state.get("registered"):
+                self.droidlink_status.set_text("Connexion au relais HTTPS…")
+            else:
+                self.droidlink_status.set_text(f"En attente du téléphone · code valide encore {state['seconds']} s.")
             code = state["code"]
             self.droidlink_code_label.set_text(f"{code[:3]} {code[3:]}")
             self.phone_battery_label.set_visible(False)
         else:
-            self.droidlink_status.set_text("Aucun téléphone DroidLink associé.")
+            self.droidlink_status.set_text(state.get("relay_error") or "Aucun téléphone DroidLink associé.")
             self.droidlink_code_label.set_text("—")
             self.phone_battery_label.set_visible(False)
         self.droidlink_empty.set_visible(not self.droidlink_messages)
@@ -2972,6 +2922,37 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _droidlink_received(self, event):
+        if event.get("type") == "contacts_list":
+            contacts = []
+            for item in event.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "Contact sans nom")).strip() or "Contact sans nom"
+                numbers = tuple(
+                    str(number).strip()[:80]
+                    for number in item.get("numbers", [])[:20]
+                    if str(number).strip()
+                ) if isinstance(item.get("numbers"), list) else ()
+                if numbers:
+                    contacts.append((name, numbers))
+            self.contacts = sorted(contacts, key=lambda item: item[0].casefold())
+            self.contacts_loaded = True
+            self.contacts_relay_request_session = ""
+            self._render_contacts()
+            self._render_call_contact_suggestions()
+            self._update_contacts_status()
+            self.contacts_status.set_text(f"{len(self.contacts)} contacts reçus par DroidLink.")
+            self._render_sms_conversations()
+            self._update_sms_contact_labels()
+            self._contacts_ready_for_sms()
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "contacts_error":
+            self.contacts_loaded = True
+            self.contacts_relay_request_session = ""
+            message = str(event.get("message") or "Autorise l’accès aux contacts dans DroidLink → Accès.")[:240]
+            self.contacts_status.set_text(message)
+            self._set_status(message, True)
+            return GLib.SOURCE_REMOVE
         if event.get("type") == "app_icons":
             for item in event.get("items", []):
                 package = item.get("package", "")
@@ -3928,12 +3909,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if self.embedded_stream_serial and (not active or self.embedded_stream_serial != active[0]):
             self._close_embedded_viewer()
         self._update_controls()
-        self._droidlink_tunnel_serial = None
-        self._ensure_droidlink_tunnel()
         self.remote_dir = "/sdcard"
         self.remote_path_label.set_text(self.remote_dir)
         self.contacts = []
         self.contacts_loaded = False
+        self.contacts_relay_request_session = ""
         self.call_peer_label = ""
         self.call_contact_search.set_text("")
         self._render_call_contact_suggestions()
@@ -4001,9 +3981,15 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self._load_current_page()
 
     def _load_current_page(self):
-        if not self._active_device() or self.busy:
+        if self.busy:
             return
         page = self.stack.get_visible_child_name()
+        if page == "contacts":
+            if not self.contacts_loaded:
+                self._refresh_contacts()
+            return
+        if not self._active_device():
+            return
         if page == "screen":
             self._refresh_apps()
         elif page == "sms":
@@ -4019,9 +4005,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self._load_photos_gallery()
         elif page == "calls" and not self.recents_loaded:
             self._refresh_recents()
-        elif page == "contacts":
-            if not self.contacts_loaded:
-                self._refresh_contacts()
 
     def _reconnect_adb(self, *_args):
         if not self.adb:
@@ -4528,6 +4511,24 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _refresh_contacts(self, *_args):
         self.contacts_display_limit = 100
+        state = self.droidlink_bridge.snapshot() if self.droidlink_bridge else {"paired": False}
+        if state.get("paired"):
+            if not state["phone"].get("notificationAccess"):
+                self.contacts_status.set_text("Autorise l’accès aux notifications dans DroidLink pour recevoir les contacts.")
+                return
+            cache_id = state.get("cache_id", "")
+            manual_refresh = bool(_args)
+            if not manual_refresh and cache_id and self.contacts_relay_request_session == cache_id:
+                return
+            self.contacts_relay_request_session = cache_id
+            self.contacts_status.set_text("Lecture des contacts par le compagnon Android…")
+            if not self.droidlink_bridge.enqueue_command("contacts_list", ""):
+                self.contacts_relay_request_session = ""
+                self.contacts_status.set_text("Le compagnon Android est hors ligne.")
+            return
+        if not self._active_device():
+            self.contacts_status.set_text("Associe DroidLink pour lire les contacts sans ADB.")
+            return
         self.contacts_status.set_text("Lecture des contacts…")
         self._run_adb_command(
             _content_query_args(
