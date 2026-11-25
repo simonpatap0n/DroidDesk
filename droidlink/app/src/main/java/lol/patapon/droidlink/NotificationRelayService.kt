@@ -224,6 +224,9 @@ class NotificationRelayService : NotificationListenerService() {
                     "photo_thumbnail" -> command.optLong("photoId", -1L)
                         .takeIf { it > 0L }
                         ?.let { DroidLinkMedia.sendThumbnail(this, token, it) }
+                    "photo_preview" -> command.optLong("photoId", -1L)
+                        .takeIf { it > 0L }
+                        ?.let { DroidLinkMedia.sendPreview(this, token, it) }
                     "app_icons" -> DroidLinkAppIcons.sendIcons(
                         this,
                         token,

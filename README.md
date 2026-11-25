@@ -8,16 +8,17 @@ La première version publique est disponible dans les [releases GitHub](https://
 
 ## Fonctionnalités
 
-- **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC.
+- **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC. L’enregistrement automatique optionnel capture la conversation en Opus quand DroidDesk détecte l’appel et relie HFP; les fichiers vont dans `Musique/DroidDesk Calls`.
 - **Contacts** et **Récents** : recherche, rappel et journal d’appels lus directement via ADB.
 - **SMS** : lire les conversations et l’historique existants depuis la base SMS Android via ADB; préparer une réponse dans l’application Messages du téléphone.
 - **Écran et apps** : afficher scrcpy dans DroidDesk, parcourir les applications avec leurs vraies icônes Android, les ouvrir dans l’écran intégré, afficher leurs réglages ou les désinstaller avec le clic droit.
-- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; ouvrir le stockage USB dans GNOME Files par MTP; charger jusqu’à 2 000 photos récentes avec vignettes et téléchargement.
+- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; ouvrir le stockage USB dans GNOME Files par MTP; afficher les 2 000 photos récentes, remplir le cache de petites vignettes puis améliorer la résolution des photos visibles.
 - **Bluetooth** : choisir un contrôleur (USB ou intégré), activer la radio, rechercher, appairer, connecter, renommer et oublier des appareils.
 - **ADB** : appairage sans fil, connexions TCP/IP, redémarrage/récupération/bootloader, touches système, captures d’écran, logcat, propriétés Android et console `adb shell`.
 - **Infos téléphone** : le fabricant, le modèle, Android, la batterie et le stockage partagé restent visibles dans l’en-tête, avec un bouton d’actualisation.
 - **Notifications** : les alertes Android arrivent comme notifications natives GNOME. Les fermer dans GNOME les ignorera aussi sur le téléphone; DroidDesk garde les 50 dernières alertes et permet d’effacer toute la liste.
 - **DroidLink** : lien Android pour les notifications, la batterie, les photos et les icônes d’applications. DroidLink ne remplace pas l’application Téléphone.
+- **Icône** : icône SVG originale, installée dans GNOME et conservée dans [`data/io.github.example.DroidDesk.svg`](data/io.github.example.DroidDesk.svg).
 - **Fonctions inspirées de KDE Connect** : batterie Android dans l’en-tête, sonnerie à distance, notifications et réponses rapides, partage de fichiers et de liens, ouverture MTP dans GNOME Files.
 
 ## Dépendances Debian
@@ -93,7 +94,9 @@ Dans **Écran et apps**, choisir une application ouvre son affichage directement
 
 Dans **Fichiers**, **Ouvrir dans GNOME · MTP** monte le stockage USB avec GVfs et l’ouvre dans Fichiers. Sur Android, choisis **Transfert de fichiers**. Pour ADB sans fil, utilise le navigateur intégré et les actions de transfert.
 
-La page **SMS** lit les messages enregistrés dans `content://sms` via la commande ADB `content query`; les messages et numéros ne sont pas transmis au service DroidLink ni enregistrés par DroidDesk. Le bouton de réponse ouvre Messages Android avec le destinataire et le texte préremplis afin que l’application habituelle confirme l’envoi. Android protège les permissions SMS des applications tierces; la lecture directe ici utilise le fournisseur accessible à l’utilisateur `shell` d’ADB.
+La page **SMS** lit les messages enregistrés dans `content://sms` via la commande ADB `content query`; les messages et numéros ne sont pas transmis au service DroidLink. DroidDesk conserve localement une copie privée des conversations et des derniers fils consultés pour les réafficher immédiatement au prochain démarrage; les fichiers sont limités à l’utilisateur du compte Linux et restent dans le cache `~/.cache/droiddesk/messages/`. Le bouton de réponse ouvre Messages Android avec le destinataire et le texte préremplis afin que l’application habituelle confirme l’envoi. Android protège les permissions SMS des applications tierces; la lecture directe ici utilise le fournisseur accessible à l’utilisateur `shell` d’ADB.
+
+La galerie garde aussi la liste des photos et les images déjà reçues dans `~/.cache/droiddesk/gallery/`. Elle affiche d’abord les petites vignettes des 2 000 photos les plus récentes, puis télécharge des aperçus plus détaillés pour les éléments visibles; ouvrir ou télécharger une photo transfère son fichier original à la demande. Ces caches locaux sont réservés à l’utilisateur Linux.
 
 ## Cible Phone Link
 

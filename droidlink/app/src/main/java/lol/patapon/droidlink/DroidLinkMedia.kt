@@ -93,35 +93,54 @@ object DroidLinkMedia {
     }
 
     fun sendThumbnail(context: Context, token: String, id: Long) {
+        sendImage(context, token, id, preview = false)
+    }
+
+    fun sendPreview(context: Context, token: String, id: Long) {
+        sendImage(context, token, id, preview = true)
+    }
+
+    private fun sendImage(context: Context, token: String, id: Long, preview: Boolean) {
         if (!hasAccess(context)) {
             post(token, JSONObject().put("type", "photo_error").put("message", "Autorise l’accès aux photos dans DroidLink → Accès."))
             return
         }
         runCatching {
             val uri: Uri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+            val size = if (preview) 900 else 160
             val bitmap = if (Build.VERSION.SDK_INT >= 29) {
-                context.contentResolver.loadThumbnail(uri, Size(180, 180), null)
+                context.contentResolver.loadThumbnail(uri, Size(size, size), null)
             } else {
                 @Suppress("DEPRECATION")
                 MediaStore.Images.Thumbnails.getThumbnail(
                     context.contentResolver,
                     id,
-                    MediaStore.Images.Thumbnails.MINI_KIND,
+                    if (preview) MediaStore.Images.Thumbnails.FULL_SCREEN_KIND
+                    else MediaStore.Images.Thumbnails.MINI_KIND,
                     null,
                 )
             }
             val output = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 72, output)
+            val maxBytes = if (preview) 480_000 else 48_000
+            var quality = if (preview) 76 else 62
+            do {
+                output.reset()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
+                quality -= 8
+            } while (output.size() > maxBytes && quality >= 52)
             bitmap.recycle()
+            if (output.size() > maxBytes) error("Aperçu trop volumineux")
+            val eventType = if (preview) "photo_preview" else "photo_thumbnail"
             post(
                 token,
                 JSONObject()
-                    .put("type", "photo_thumbnail")
+                    .put("type", eventType)
                     .put("id", id)
                     .put("jpeg", Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)),
             )
         }.onFailure {
-            post(token, JSONObject().put("type", "photo_thumbnail_error").put("id", id).put("message", it.message.orEmpty().take(200)))
+            val eventType = if (preview) "photo_preview_error" else "photo_thumbnail_error"
+            post(token, JSONObject().put("type", eventType).put("id", id).put("message", it.message.orEmpty().take(200)))
         }
     }
 

@@ -125,10 +125,10 @@ APP_CSS = """
   line-height: 1.35;
 }
 .droiddesk-window .app-tile {
-  min-height: 216px;
-  padding: 8px;
+  min-height: 176px;
+  padding: 6px;
   border: 1px solid @borders;
-  border-radius: 18px;
+  border-radius: 16px;
   background-color: @card_bg_color;
   transition: background-color 150ms ease, border-color 150ms ease;
 }
@@ -137,18 +137,21 @@ APP_CSS = """
   background-color: @view_bg_color;
 }
 .droiddesk-window .app-icon-frame {
-  min-width: 148px;
-  min-height: 148px;
-  border-radius: 26px;
+  min-width: 96px;
+  min-height: 96px;
+  border-radius: 22px;
   background-color: alpha(@accent_bg_color, 0.08);
 }
 .droiddesk-window .app-tile-name {
-  font-size: 1.08em;
+  font-size: 0.98em;
   font-weight: 650;
 }
 .droiddesk-window .gallery-thumbnail {
   border-radius: 12px;
   background-color: @view_bg_color;
+}
+.droiddesk-window .gallery-thumbnail-placeholder {
+  color: alpha(@accent_color, 0.75);
 }
 .droiddesk-window .embedded-screen {
   padding: 12px;
@@ -223,10 +226,36 @@ APP_CSS = """
   font-size: 1.22em;
   font-weight: 700;
 }
+.droiddesk-window .call-recording-card {
+  padding: 14px 18px;
+  border: 1px solid alpha(#e01b24, 0.30);
+  border-radius: 18px;
+  background-color: alpha(#e01b24, 0.07);
+}
+.droiddesk-window .call-recording-card.recording-disabled {
+  border-color: @borders;
+  background-color: @card_bg_color;
+}
+.droiddesk-window .call-recording-icon {
+  color: #e01b24;
+}
+.droiddesk-window .call-recording-title {
+  font-size: 1.12em;
+  font-weight: 700;
+}
 .droiddesk-window .call-number-entry {
-  min-height: 52px;
-  font-size: 1.4em;
+  min-width: 0;
+  min-height: 42px;
+  font-size: 1.08em;
   font-weight: 600;
+}
+.droiddesk-window .call-number-controls {
+  margin-top: 4px;
+}
+.droiddesk-window .adb-device-row {
+  min-height: 44px;
+  padding-top: 1px;
+  padding-bottom: 1px;
 }
 .droiddesk-window .call-keypad button {
   min-width: 70px;
@@ -634,6 +663,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.scrcpy_server = find_executable("scrcpy-server", SCRCPY_SERVER_CANDIDATES)
         self.madbfs = find_executable("madbfs", MADBFS_CANDIDATES)
         self.devices = []
+        self.adb_mdns_devices = []
         self.android_wifi_connected = None
         self.device_profiles = {}
         self.contacts = []
@@ -641,6 +671,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.contacts_display_limit = 100
         self.contacts_search_source = 0
         self.sms_waiting_for_contacts = False
+        self.sms_live_refresh_started = False
+        self.sms_loading_cache = False
+        self.sms_cache_loaded_serial = None
         self.sms_canonical_addresses = {}
         self.recents = []
         self.recents_loaded = False
@@ -700,6 +733,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.call_recording_enabled = self._load_call_recording_enabled()
         self.call_recording_process = None
         self.call_recording_path = None
+        self.call_recording_issue = ""
         self.photo_preview_dir = None
         self.photo_preview_window = None
         self.external_photo_dirs = []
@@ -708,7 +742,14 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.gallery_cards = {}
         self.gallery_requested_thumbnails = set()
         self.gallery_thumbnail_cache_paths = {}
+        self.gallery_preview_cache_paths = {}
+        self.gallery_requested_previews = set()
+        self.gallery_ready_thumbnails = set()
         self.gallery_thumbnail_cache_dir = None
+        self.gallery_visible_range = (0, 0)
+        self.gallery_prefetch_cursor = 0
+        self.gallery_prefetch_queue = []
+        self.gallery_prefetch_timer = 0
         self.gallery_selected = None
         self.phone_preview_serial = None
         self.phone_preview_generation = 0
@@ -1379,8 +1420,36 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return page
 
     def _build_adb_page(self):
-        page = self._page()
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_margin_top(16)
+        page.set_margin_bottom(16)
+        page.set_margin_start(18)
+        page.set_margin_end(18)
         page.append(self._heading("ADB et connexion", "Connexion, maintenance, diagnostic et console Android."))
+
+        self.adb_devices_group = Adw.PreferencesGroup.new()
+        self.adb_devices_group.set_title("Téléphones détectés")
+        self.adb_devices_group.set_description("Appareils ADB connectés et téléphones sans fil disponibles après appairage.")
+        devices_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.adb_devices_summary = Gtk.Label(label="Recherche des téléphones…", xalign=0)
+        self.adb_devices_summary.set_hexpand(True)
+        self.adb_devices_summary.add_css_class("dim-label")
+        devices_toolbar.append(self.adb_devices_summary)
+        self.adb_refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        self.adb_refresh_button.set_tooltip_text("Actualiser les connexions ADB et les appareils Wi-Fi appairés")
+        self.adb_refresh_button.connect("clicked", lambda *_: self.refresh_devices())
+        devices_toolbar.append(self.adb_refresh_button)
+        self.adb_devices_group.add(devices_toolbar)
+        self.adb_devices_list = Gtk.ListBox()
+        self.adb_devices_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.adb_devices_list.add_css_class("boxed-list")
+        adb_devices_scroll = Gtk.ScrolledWindow()
+        adb_devices_scroll.set_min_content_height(60)
+        adb_devices_scroll.set_max_content_height(190)
+        adb_devices_scroll.set_child(self.adb_devices_list)
+        self.adb_devices_group.add(adb_devices_scroll)
+        page.append(self.adb_devices_group)
+
         self.adb_status_card = Adw.PreferencesGroup.new()
         self.adb_status_card.set_title("Débogage Android")
         self.adb_status_card.set_description("Les actions appareil exigent un téléphone autorisé dans ADB.")
@@ -1390,18 +1459,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.adb_status_card.add(self.adb_path_row)
         page.append(self.adb_status_card)
 
-        controls = Gtk.FlowBox()
-        controls.set_selection_mode(Gtk.SelectionMode.NONE)
-        controls.set_min_children_per_line(1)
-        controls.set_max_children_per_line(2)
-        controls.set_row_spacing(6)
-        controls.set_column_spacing(6)
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.adb_start_button = Gtk.Button(label="Démarrer ADB")
         self.adb_start_button.connect("clicked", lambda *_: self._run_adb_command(["start-server"], "Démarrage du serveur ADB…", lambda r, e: self._command_status(r, e, "Serveur ADB démarré."), needs_device=False))
         controls.append(self.adb_start_button)
-        self.adb_refresh_button = Gtk.Button(label="Actualiser les appareils")
-        self.adb_refresh_button.connect("clicked", lambda *_: self.refresh_devices())
-        controls.append(self.adb_refresh_button)
         page.append(controls)
 
         wireless = Adw.PreferencesGroup.new()
@@ -1427,6 +1488,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         connect_row.add_suffix(self.adb_connect_button)
         wireless.add(connect_row)
         page.append(wireless)
+
+        advanced_expander = Gtk.Expander.new("Outils avancés")
+        advanced_contents = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        advanced_expander.set_child(advanced_contents)
+        page.append(advanced_expander)
 
         server_group = Adw.PreferencesGroup.new()
         server_group.set_title("Alimentation et redémarrage")
@@ -1483,7 +1549,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         key_row.set_title("Touches système")
         key_row.add_suffix(key_actions)
         server_group.add(key_row)
-        page.append(server_group)
+        advanced_contents.append(server_group)
 
         server_group = Adw.PreferencesGroup.new()
         server_group.set_title("Console shell Android")
@@ -1515,7 +1581,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         output_scroll.set_max_content_height(300)
         output_scroll.set_child(self.adb_output)
         server_group.add(output_scroll)
-        page.append(server_group)
+        advanced_contents.append(server_group)
 
         diagnostics = Adw.PreferencesGroup.new()
         diagnostics.set_title("Diagnostics")
@@ -1541,7 +1607,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         diagnostic_row.set_title("Informations et journaux")
         diagnostic_row.add_suffix(diagnostic_buttons)
         diagnostics.add(diagnostic_row)
-        page.append(diagnostics)
+        advanced_contents.append(diagnostics)
 
         server_group = Adw.PreferencesGroup.new()
         server_group.set_title("Serveur ADB")
@@ -1551,7 +1617,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         stop_row.set_title("Redémarrer en cas de blocage")
         stop_row.add_suffix(self.adb_stop_button)
         server_group.add(stop_row)
-        page.append(server_group)
+        advanced_contents.append(server_group)
         return page
 
     def _build_calls_page(self):
@@ -1560,6 +1626,49 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             "Appels",
             "Compose, rappelle et prends les appels du téléphone directement depuis GNOME.",
         ))
+
+        self.call_recording_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.call_recording_card.add_css_class("call-recording-card")
+        if not self.call_recording_enabled:
+            self.call_recording_card.add_css_class("recording-disabled")
+        recording_icon = Gtk.Image.new_from_icon_name("media-record-symbolic")
+        recording_icon.set_pixel_size(26)
+        recording_icon.add_css_class("call-recording-icon")
+        self.call_recording_card.append(recording_icon)
+        recording_details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        recording_details.set_hexpand(True)
+        recording_title = Gtk.Label(label="Enregistrement automatique", xalign=0)
+        recording_title.add_css_class("call-recording-title")
+        recording_details.append(recording_title)
+        recording_subtitle = Gtk.Label(
+            label="Capture l’appel quand DroidDesk le détecte et que l’audio mains libres HFP est relié.",
+            xalign=0,
+        )
+        recording_subtitle.set_wrap(True)
+        recording_subtitle.add_css_class("dim-label")
+        recording_details.append(recording_subtitle)
+        self.call_recording_status = Gtk.Label(xalign=0)
+        self.call_recording_status.set_wrap(True)
+        self.call_recording_status.add_css_class("dim-label")
+        self.call_recording_status.set_text(
+            self._call_recording_ready_message()
+            if self.call_recording_enabled
+            else "Désactivé · aucun nouveau fichier ne sera créé."
+        )
+        recording_details.append(self.call_recording_status)
+        self.call_recording_card.append(recording_details)
+        self.call_recording_folder_button = Gtk.Button.new_from_icon_name("folder-open-symbolic")
+        self.call_recording_folder_button.set_tooltip_text("Ouvrir le dossier des enregistrements")
+        self.call_recording_folder_button.add_css_class("flat")
+        self.call_recording_folder_button.connect("clicked", self._open_call_recording_folder)
+        self.call_recording_card.append(self.call_recording_folder_button)
+        self.call_recording_switch = Gtk.Switch()
+        self.call_recording_switch.set_valign(Gtk.Align.CENTER)
+        self.call_recording_switch.set_active(self.call_recording_enabled)
+        self.call_recording_switch.set_tooltip_text("Activer ou désactiver l’enregistrement automatique des appels")
+        self.call_recording_switch.connect("notify::active", self._call_recording_toggled)
+        self.call_recording_card.append(self.call_recording_switch)
+        page.append(self.call_recording_card)
 
         self.call_status_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         self.call_status_card.add_css_class("call-status-card")
@@ -1613,16 +1722,21 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.number_entry.set_activates_default(True)
         self.number_entry.connect("activate", self._place_call)
         self.number_entry.set_hexpand(True)
-        number_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        number_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        number_controls.add_css_class("call-number-controls")
         self.call_number_controls = number_controls
+        self.number_entry.set_width_chars(8)
+        self.number_entry.set_max_width_chars(13)
         number_controls.append(self.number_entry)
         clear_number_button = Gtk.Button.new_from_icon_name("edit-clear-symbolic")
         clear_number_button.add_css_class("flat")
+        clear_number_button.set_size_request(34, 36)
         clear_number_button.set_tooltip_text("Effacer le numéro")
         clear_number_button.connect("clicked", self._clear_call_number)
         number_controls.append(clear_number_button)
         delete_digit_button = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
         delete_digit_button.add_css_class("flat")
+        delete_digit_button.set_size_request(34, 36)
         delete_digit_button.set_tooltip_text("Effacer le dernier chiffre")
         delete_digit_button.connect("clicked", self._delete_call_digit)
         number_controls.append(delete_digit_button)
@@ -1633,6 +1747,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.dialpad.set_row_spacing(7)
         self.dialpad.set_column_spacing(7)
         self.dialpad.set_halign(Gtk.Align.CENTER)
+        self.dialpad.set_margin_top(4)
         dial_keys = (
             ("1", ""), ("2", "ABC"), ("3", "DEF"),
             ("4", "GHI"), ("5", "JKL"), ("6", "MNO"),
@@ -1658,6 +1773,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.dial_button = Gtk.Button(label="Appeler depuis GNOME")
         self.dial_button.add_css_class("suggested-action")
         self.dial_button.set_hexpand(True)
+        self.dial_button.set_margin_top(8)
         self.dial_button.connect("clicked", self._call_button_clicked)
         outgoing.add(self.dial_button)
         outgoing.set_vexpand(True)
@@ -1763,24 +1879,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.call_audio_status.set_wrap(True)
         self.call_audio_status.add_css_class("dim-label")
         audio_group.add(self.call_audio_status)
-        recording_row = Adw.ActionRow.new()
-        recording_row.set_title("Enregistrement automatique")
-        recording_row.set_subtitle("Enregistre le son du PC pendant les appels reliés en HFP.")
-        self.call_recording_switch = Gtk.Switch()
-        self.call_recording_switch.set_valign(Gtk.Align.CENTER)
-        self.call_recording_switch.set_active(self.call_recording_enabled)
-        self.call_recording_switch.connect("notify::active", self._call_recording_toggled)
-        recording_row.add_suffix(self.call_recording_switch)
-        recording_row.set_activatable_widget(self.call_recording_switch)
-        audio_group.add(recording_row)
-        self.call_recording_status = Gtk.Label(
-            label=("Enregistrement automatique activé · fichiers WAV dans Musique/DroidDesk Calls."
-                   if self.call_recording_enabled else "Enregistrement désactivé."),
-            xalign=0,
-        )
-        self.call_recording_status.set_wrap(True)
-        self.call_recording_status.add_css_class("dim-label")
-        audio_group.add(self.call_recording_status)
         page.append(audio_group)
 
         quick_links = Gtk.FlowBox()
@@ -1789,14 +1887,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         quick_links.set_max_children_per_line(2)
         quick_links.set_row_spacing(8)
         quick_links.set_column_spacing(8)
-        self.contacts_quick_button = Gtk.Button(label="Ouvrir les contacts")
-        self.contacts_quick_button.connect("clicked", lambda *_: self.stack.set_visible_child_name("contacts"))
         self.ring_phone_button = Gtk.Button(label="Faire sonner le téléphone")
         self.ring_phone_button.set_tooltip_text("Faire jouer la sonnerie Android pendant 30 secondes")
         self.ring_phone_button.connect("clicked", self._ring_phone)
         self.stop_phone_ring_button = Gtk.Button(label="Arrêter la sonnerie")
         self.stop_phone_ring_button.connect("clicked", self._stop_phone_ring)
-        quick_links.append(self.contacts_quick_button)
         quick_links.append(self.ring_phone_button)
         quick_links.append(self.stop_phone_ring_button)
         page.append(quick_links)
@@ -1895,11 +1990,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.apps_group.add(self.apps_icon_status)
         self.apps_grid = Gtk.FlowBox()
         self.apps_grid.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.apps_grid.set_homogeneous(False)
+        self.apps_grid.set_homogeneous(True)
         self.apps_grid.set_min_children_per_line(2)
-        self.apps_grid.set_max_children_per_line(5)
-        self.apps_grid.set_row_spacing(12)
-        self.apps_grid.set_column_spacing(12)
+        self.apps_grid.set_max_children_per_line(4)
+        self.apps_grid.set_row_spacing(10)
+        self.apps_grid.set_column_spacing(10)
         self.apps_grid.set_valign(Gtk.Align.START)
         apps_scroll = Gtk.ScrolledWindow()
         apps_scroll.set_min_content_height(300)
@@ -1948,9 +2043,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.photos_flow.set_selection_mode(Gtk.SelectionMode.NONE)
         self.photos_flow.set_homogeneous(True)
         self.photos_flow.set_min_children_per_line(1)
-        self.photos_flow.set_max_children_per_line(4)
-        self.photos_flow.set_row_spacing(14)
-        self.photos_flow.set_column_spacing(14)
+        self.photos_flow.set_max_children_per_line(3)
+        self.photos_flow.set_row_spacing(8)
+        self.photos_flow.set_column_spacing(8)
         self.photos_flow.set_valign(Gtk.Align.START)
         self.photos_scroll = Gtk.ScrolledWindow()
         self.photos_scroll.set_min_content_height(0)
@@ -2716,6 +2811,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.bluez.call(self.selected_adapter, "org.bluez.Adapter1", method, callback=lambda _reply, error: self._set_status(f"Recherche Bluetooth impossible : {_error_text(error)}" if error else ("Recherche arrêtée" if method == "StopDiscovery" else "Recherche Bluetooth démarrée"), bool(error)))
 
     def _on_close(self, *_args):
+        if getattr(self, "gallery_prefetch_timer", 0):
+            GLib.source_remove(self.gallery_prefetch_timer)
+            self.gallery_prefetch_timer = 0
         for serial in list(getattr(self, "phone_mounts", {})):
             self._unmount_phone_storage(serial)
         recording = self.call_recording_process
@@ -2903,13 +3001,25 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if event.get("type") == "photo_thumbnail":
             self._display_photo_thumbnail(event)
             return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_preview":
+            self._display_photo_preview(event)
+            return GLib.SOURCE_REMOVE
         if event.get("type") == "photo_error":
             self.gallery_loaded = True
             message = event.get("message") or "DroidLink n’a pas pu lire les photos du téléphone."
-            self.photos_status.set_text(message)
+            if self.gallery_photos:
+                self.photos_status.set_text(f"Cache photo conservé · actualisation impossible : {message}")
+            else:
+                self.photos_status.set_text(message)
             self._set_status(message, True)
             return GLib.SOURCE_REMOVE
-        if event.get("type") == "photo_thumbnail_error":
+        if event.get("type") in ("photo_thumbnail_error", "photo_preview_error"):
+            try:
+                photo_id = int(event.get("id", 0))
+                self.gallery_requested_thumbnails.discard(photo_id)
+                self.gallery_requested_previews.discard(photo_id)
+            except (TypeError, ValueError):
+                pass
             return GLib.SOURCE_REMOVE
         if event.get("type") == "command_result":
             if event.get("action") != "dismiss":
@@ -3811,6 +3921,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _on_device_selected(self, *_args):
         active = self._active_device()
+        if self.gallery_prefetch_timer:
+            GLib.source_remove(self.gallery_prefetch_timer)
+            self.gallery_prefetch_timer = 0
         self.android_wifi_connected = None
         if self.embedded_stream_serial and (not active or self.embedded_stream_serial != active[0]):
             self._close_embedded_viewer()
@@ -3833,17 +3946,33 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_messages = []
         self.sms_selected_thread = None
         self.sms_selected_number = ""
+        self.sms_selected_recipients = []
+        self.sms_thread_is_group = False
         self.sms_new_mode = False
         self.sms_waiting_for_contacts = False
+        self.sms_live_refresh_started = False
+        self.sms_cache_loaded_serial = None
+        self.sms_status.set_text("Lecture des SMS enregistrés sur Android…")
+        if active:
+            self._load_sms_conversation_cache()
         self.gallery_loaded = False
         self.gallery_photos = []
         self.gallery_cards.clear()
+        self.gallery_requested_thumbnails.clear()
+        self.gallery_requested_previews.clear()
+        self.gallery_ready_thumbnails.clear()
         self.gallery_thumbnail_cache_paths.clear()
+        self.gallery_preview_cache_paths.clear()
         self.gallery_thumbnail_cache_dir = None
+        self.gallery_visible_range = (0, 0)
+        self.gallery_prefetch_cursor = 0
+        self.gallery_prefetch_queue = []
         while child := self.photos_flow.get_first_child():
             self.photos_flow.remove(child)
         self.photos_status.set_text("Choisis Actualiser pour charger les 2 000 photos récentes de ce téléphone.")
+        self.sms_loading_cache = True
         self._render_sms_conversations()
+        self.sms_loading_cache = False
         self._render_sms_thread()
         self._render_contacts()
         self._render_recents()
@@ -3863,6 +3992,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.contacts_status.set_text("Connectez un téléphone ADB pour charger les contacts.")
             self.recents_status.set_text("Connectez un téléphone ADB pour charger les appels.")
             self._refresh_phone_preview()
+        self._render_adb_device_list()
 
     def _on_page_changed(self, *_args):
         self._sync_navigation_selection()
@@ -3881,7 +4011,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 if not self.sms_waiting_for_contacts:
                     self.sms_waiting_for_contacts = True
                     self._refresh_contacts()
-            elif not self.sms_conversations:
+            elif not self.sms_live_refresh_started:
                 self._refresh_sms()
         elif page == "files":
             self._load_directory()
@@ -4005,18 +4135,176 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if not self.adb:
             self._set_status("adb est introuvable. Installez Android Platform Tools.", True)
             return
-        self._run_adb_command(["devices", "-l"], "Recherche des téléphones…", self._devices_result, needs_device=False)
+        if self.busy:
+            return
+        self._set_busy(True)
+        self._set_status("Recherche des téléphones connectés et appairés en Wi-Fi…")
+
+        def worker():
+            try:
+                devices = subprocess.run(
+                    [self.adb, "devices", "-l"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                error = None
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                devices, error = None, str(exc)
+            try:
+                mdns = subprocess.run(
+                    [self.adb, "mdns", "services"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                mdns_error = None
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                mdns, mdns_error = None, str(exc)
+            GLib.idle_add(self._adb_devices_scan_result, devices, error, mdns, mdns_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _adb_devices_scan_result(self, devices, error, mdns, mdns_error):
+        self._set_busy(False)
+        discovered = {}
+        if mdns and mdns.returncode == 0:
+            for line in mdns.stdout.splitlines():
+                if "_adb-tls-connect._tcp" not in line:
+                    continue
+                fields = line.split()
+                endpoint = next(
+                    (
+                        field for field in fields[1:]
+                        if re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+):\d+", field)
+                    ),
+                    None,
+                )
+                if not endpoint:
+                    continue
+                service_name = fields[0].split("._adb", 1)[0].removeprefix("adb-").strip(" .")
+                discovered[endpoint] = service_name or "Téléphone Android"
+        self.adb_mdns_devices = list(discovered.items())
+        scan_error = error if devices is not None else (error or mdns_error)
+        self._devices_result(devices, scan_error)
+        return GLib.SOURCE_REMOVE
+
+    def _render_adb_device_list(self):
+        if not hasattr(self, "adb_devices_list"):
+            return
+        while child := self.adb_devices_list.get_first_child():
+            self.adb_devices_list.remove(child)
+
+        active = self._active_device()
+        active_serial = active[0] if active else ""
+        connected = sum(state == "device" for _serial, state, _model in self.devices)
+        awaiting = sum(state in ("offline", "unauthorized") for _serial, state, _model in self.devices)
+        connected_serials = {serial for serial, _state, _model in self.devices}
+        wireless_available = [
+            (endpoint, name)
+            for endpoint, name in self.adb_mdns_devices
+            if endpoint not in connected_serials
+        ]
+        self.adb_devices_summary.set_text(
+            f"{connected} connecté(s) · {awaiting} en attente · {len(wireless_available)} appairé(s) disponibles en Wi-Fi"
+        )
+
+        for serial, state, model in self.devices:
+            row = Adw.ActionRow.new()
+            row.add_css_class("adb-device-row")
+            row.set_title(GLib.markup_escape_text(model or serial))
+            if state == "device":
+                connection = "Connecté · ADB Wi-Fi" if self._adb_serial_is_wireless(serial) else "Connecté · USB"
+            elif state == "unauthorized":
+                connection = "Autorisation à confirmer sur Android"
+            elif state == "offline":
+                connection = "Détecté · hors ligne"
+            else:
+                connection = f"Détecté · {state}"
+            row.set_subtitle(connection)
+            row.set_tooltip_text(serial)
+            row.add_prefix(Gtk.Image.new_from_icon_name("phone-symbolic"))
+            if state == "device":
+                select_button = Gtk.Button(label="Actif" if serial == active_serial else "Utiliser")
+                select_button.add_css_class("flat" if serial == active_serial else "suggested-action")
+                select_button.set_valign(Gtk.Align.CENTER)
+                select_button.set_sensitive(serial != active_serial and not self.busy)
+                select_button.connect("clicked", lambda _button, value=serial: self._select_adb_device(value))
+                row.add_suffix(select_button)
+            self.adb_devices_list.append(row)
+
+        for endpoint, name in wireless_available:
+            row = Adw.ActionRow.new()
+            row.add_css_class("adb-device-row")
+            row.set_title(GLib.markup_escape_text(name))
+            row.set_subtitle("Appairé · disponible sur ADB Wi-Fi")
+            row.set_tooltip_text(endpoint)
+            row.add_prefix(Gtk.Image.new_from_icon_name("phone-symbolic"))
+            connect_button = Gtk.Button(label="Connecter")
+            connect_button.add_css_class("suggested-action")
+            connect_button.set_valign(Gtk.Align.CENTER)
+            connect_button.set_sensitive(not self.busy)
+            connect_button.connect(
+                "clicked",
+                lambda _button, value=endpoint: self._connect_adb_mdns_device(value),
+            )
+            row.add_suffix(connect_button)
+            self.adb_devices_list.append(row)
+
+        if not self.devices and not wireless_available:
+            row = Gtk.ListBoxRow()
+            message = Gtk.Label(
+                label="Aucun téléphone détecté · branche USB ou active Débogage sans fil, puis actualise.",
+                xalign=0,
+            )
+            message.set_wrap(True)
+            message.add_css_class("dim-label")
+            message.set_margin_top(8)
+            message.set_margin_bottom(8)
+            row.set_child(message)
+            row.set_selectable(False)
+            row.set_activatable(False)
+            self.adb_devices_list.append(row)
+
+    def _select_adb_device(self, serial):
+        index = next((i for i, device in enumerate(self.devices) if device[0] == serial and device[1] == "device"), None)
+        if index is not None:
+            self.device_picker.set_selected(index)
+
+    def _connect_adb_mdns_device(self, endpoint):
+        self._run_adb_command(
+            ["connect", endpoint],
+            f"Connexion ADB Wi-Fi à {endpoint}…",
+            lambda result, error: self._adb_mdns_connect_result(endpoint, result, error),
+            needs_device=False,
+            timeout=15,
+        )
+
+    def _adb_mdns_connect_result(self, endpoint, result, error):
+        output = (result.stdout or result.stderr).strip() if result else ""
+        if error or not result or result.returncode != 0 or any(
+            term in output.casefold() for term in ("failed", "cannot connect", "unable to connect")
+        ):
+            self._set_status(f"Connexion ADB Wi-Fi impossible · {output or error or endpoint}", True)
+        else:
+            self._set_status(output or f"Téléphone connecté sur ADB Wi-Fi · {endpoint}")
+        self.refresh_devices()
+        return GLib.SOURCE_REMOVE
 
     def _devices_result(self, result, error):
         if error:
             self.devices = []
             self._replace_device_model(["ADB indisponible"])
+            self._render_adb_device_list()
             self._set_status(f"ADB n’a pas démarré : {error}", True)
             self._update_controls()
             return
         if result.returncode != 0:
             self.devices = []
             self._replace_device_model(["ADB indisponible"])
+            self._render_adb_device_list()
             self._set_status((result.stderr or result.stdout).strip() or "Échec de la détection ADB", True)
             self._update_controls()
             return
@@ -4042,9 +4330,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if selected is None:
             selected = 0 if devices else Gtk.INVALID_LIST_POSITION
         self._replace_device_model(labels or ["Aucun téléphone ADB"], selected)
+        self._render_adb_device_list()
         self._update_controls()
         if not devices:
-            self._set_status("Aucun téléphone ADB détecté. Active le débogage sans fil et associe le téléphone.")
+            if self.adb_mdns_devices:
+                self._set_status("Téléphone appairé détecté sur ADB Wi-Fi · utilise Connecter dans la liste.")
+            else:
+                self._set_status("Aucun téléphone ADB détecté. Active le débogage sans fil et associe le téléphone.")
         elif any(state == "unauthorized" for _serial, state, _model in devices):
             self._set_status("Autorise le débogage Android sur le téléphone, puis actualise.")
         elif not any(state == "device" for _serial, state, _model in devices):
@@ -4647,8 +4939,173 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("sms")
         self.sms_body_view.grab_focus()
 
+    def _sms_cache_directory(self):
+        identity = self._phone_cache_identity()
+        if not identity:
+            return None
+        device_key = hashlib.sha256(identity.casefold().encode("utf-8")).hexdigest()[:24]
+        return Path(GLib.get_user_cache_dir()) / "droiddesk" / "messages" / device_key
+
+    def _phone_cache_identity(self):
+        state = self.droidlink_bridge.snapshot() if self.droidlink_bridge else {"phone": {}}
+        if state.get("cache_id"):
+            return state["cache_id"]
+        phone = state.get("phone", {})
+        identity = "|".join(
+            str(phone.get(key, "")).strip()
+            for key in ("manufacturer", "model", "android")
+            if phone.get(key)
+        )
+        active = self._active_device()
+        return identity or (str(active[0]) if active else "")
+
+    def _load_sms_conversation_cache(self):
+        active = self._active_device()
+        directory = self._sms_cache_directory()
+        if not active or not directory:
+            return
+        try:
+            payload = json.loads((directory / "conversations.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        cached_conversations = payload.get("conversations", [])
+        if not isinstance(cached_conversations, list):
+            return
+        conversations = []
+        for item in cached_conversations[:500]:
+            if not isinstance(item, dict) or not str(item.get("thread_id", "")).isdigit():
+                continue
+            try:
+                conversations.append({
+                    "thread_id": str(item["thread_id"]),
+                    "recipient_ids": [str(value) for value in item.get("recipient_ids", []) if str(value).isdigit()][:50],
+                    "recipients": [str(value)[:180] for value in item.get("recipients", []) if value][:50],
+                    "is_group": bool(item.get("is_group", False)),
+                    "number": str(item.get("number", ""))[:1000],
+                    "date": max(0, int(item.get("date", 0))),
+                    "preview": str(item.get("preview", ""))[:500],
+                    "unread": max(0, int(item.get("unread", 0))),
+                    "count": max(0, int(item.get("count", 0))),
+                })
+            except (TypeError, ValueError):
+                continue
+        conversations.sort(key=lambda conversation: conversation["date"], reverse=True)
+        self.sms_conversations = conversations
+        canonical = payload.get("canonical_addresses", {})
+        self.sms_canonical_addresses = {
+            str(key): str(value)[:180]
+            for key, value in list(canonical.items())[:5_000]
+            if str(key).isdigit() and value
+        } if isinstance(canonical, dict) else {}
+        self.sms_cache_loaded_serial = active[0]
+        selected = str(payload.get("selected_thread", ""))
+        if selected.isdigit() and any(item["thread_id"] == selected for item in conversations):
+            self.sms_selected_thread = selected
+            cached_thread = self._read_sms_thread_cache(selected)
+            if cached_thread:
+                self.sms_selected_recipients = cached_thread.get("recipients", [])
+                self.sms_thread_is_group = bool(cached_thread.get("is_group", False))
+                self._show_sms_thread_messages(cached_thread.get("messages", []), from_cache=True)
+        self.sms_status.set_text(
+            f"Cache local · {len(conversations)} conversations · actualisation dès l’ouverture de Messages."
+        )
+
+    def _save_sms_conversations_cache(self):
+        directory = self._sms_cache_directory()
+        if not directory:
+            return
+        active = self._active_device()
+        if active:
+            self.sms_cache_loaded_serial = active[0]
+        payload = {
+            "selected_thread": self.sms_selected_thread or "",
+            "canonical_addresses": self.sms_canonical_addresses,
+            "conversations": [
+                {**item, "preview": str(item.get("preview", ""))[:500]}
+                for item in self.sms_conversations[:500]
+            ],
+        }
+        self._write_private_cache_bytes(
+            directory / "conversations.json",
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+
+    def _sms_thread_cache_path(self, thread_id):
+        directory = self._sms_cache_directory()
+        if not directory or not str(thread_id).isdigit():
+            return None
+        return directory / "threads" / f"{thread_id}.json"
+
+    def _read_sms_thread_cache(self, thread_id):
+        path = self._sms_thread_cache_path(thread_id)
+        if not path:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            return None
+        messages = []
+        for item in payload["messages"][-100:]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                messages.append({
+                    "id": str(item.get("id", ""))[:40],
+                    "transport": "mms" if item.get("transport") == "mms" else "sms",
+                    "address": str(item.get("address", ""))[:180],
+                    "date": max(0, int(item.get("date", 0))),
+                    "type": int(item.get("type", 0)),
+                    "body": str(item.get("body", ""))[:6_000],
+                    "subject": str(item.get("subject", ""))[:500],
+                    "media": [str(value)[:180] for value in item.get("media", [])[:20]],
+                    "sender": str(item.get("sender", ""))[:180],
+                })
+            except (TypeError, ValueError):
+                continue
+        recipients = payload.get("recipients", [])
+        if not isinstance(recipients, list):
+            recipients = []
+        return {
+            "messages": messages,
+            "recipients": [str(value)[:180] for value in recipients[:50]],
+            "is_group": bool(payload.get("is_group", False)),
+        }
+
+    def _save_sms_thread_cache(self, thread_id):
+        path = self._sms_thread_cache_path(thread_id)
+        if not path:
+            return
+        payload = {
+            "recipients": self.sms_selected_recipients[:50],
+            "is_group": bool(self.sms_thread_is_group),
+            "messages": [
+                {
+                    **message,
+                    "body": str(message.get("body", ""))[:6_000],
+                    "subject": str(message.get("subject", ""))[:500],
+                    "media": [str(value)[:180] for value in message.get("media", [])[:20]],
+                }
+                for message in self.sms_messages[-100:]
+            ],
+        }
+        self._write_private_cache_bytes(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        try:
+            cached = sorted(path.parent.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+            for old_path in cached[20:]:
+                old_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _refresh_sms(self, *_args):
-        self.sms_status.set_text("Lecture des SMS, MMS et conversations de groupe…")
+        self.sms_live_refresh_started = True
+        self.sms_status.set_text("Mise à jour des SMS et conversations depuis Android…")
         self._run_adb_command(
             _content_query_args("content://mms-sms/canonical-addresses", "_id:address"),
             "Lecture des destinataires des conversations…",
@@ -4657,8 +5114,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         )
 
     def _sms_canonical_result(self, result, error):
-        self.sms_canonical_addresses = {}
         if not error and result and result.returncode == 0:
+            self.sms_canonical_addresses = {}
             for item in _content_rows(result.stdout):
                 address_id = item.get("_id", "").strip()
                 address = item.get("address", "").strip()
@@ -4680,12 +5137,15 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _sms_list_result(self, result, error):
         if error or not result or result.returncode != 0:
             detail = error or ((result.stderr or result.stdout).strip() if result else "")
-            self.sms_conversations = []
-            self._render_sms_conversations()
             message = "Android n’a pas laissé ADB lire les conversations SMS/MMS. Vérifie que le téléphone est déverrouillé et que son fournisseur de messages est disponible."
             if detail:
                 message += f" Détail : {detail[:220]}"
-            self.sms_status.set_text(message)
+            if self.sms_cache_loaded_serial == (self._active_device() or (None,))[0] and self.sms_conversations:
+                self.sms_status.set_text(f"Cache local affiché · actualisation impossible. {message}")
+            else:
+                self.sms_conversations = []
+                self._render_sms_conversations()
+                self.sms_status.set_text(message)
             self._set_status("Historique SMS/MMS indisponible.", True)
             return
 
@@ -4718,11 +5178,17 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             }
             conversations.append(conversation)
         conversations.sort(key=lambda conversation: conversation["date"], reverse=True)
+        selected_before_refresh = self.sms_selected_thread
         self.sms_conversations = conversations
         self._render_sms_conversations()
+        self._save_sms_conversations_cache()
         total = sum(conversation["count"] for conversation in conversations)
         self.sms_status.set_text(f"{total:,} SMS et MMS · {len(conversations)} conversations · lus directement sur le téléphone.".replace(",", " "))
         self._set_status(f"Historique SMS/MMS chargé : {len(conversations)} conversations, groupes compris.")
+        if selected_before_refresh and any(
+            str(item["thread_id"]) == str(selected_before_refresh) for item in conversations
+        ):
+            GLib.idle_add(self._load_sms_thread, selected_before_refresh)
 
     def _sms_display_name(self, number):
         number = str(number or "").strip()
@@ -4848,7 +5314,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.sms_sidebar_list.unselect_all()
         self.sms_updating_list = False
 
-        if should_load and selected_thread:
+        if should_load and selected_thread and not self.sms_loading_cache:
             GLib.idle_add(self._load_sms_thread, selected_thread)
         elif not self.sms_conversations:
             self.sms_thread_title.set_text("Aucune conversation SMS")
@@ -4892,6 +5358,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_new_mode = False
         self.sms_number_entry.set_visible(False)
         self.sms_selected_thread = str(thread_id)
+        self._save_sms_conversations_cache()
         conversation = next(
             (item for item in self.sms_conversations if str(item["thread_id"]) == str(thread_id)),
             {},
@@ -4899,7 +5366,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_selected_recipients = self._sms_conversation_numbers(conversation)
         self.sms_thread_is_group = conversation.get("is_group", len(self.sms_selected_recipients) > 1)
         self.sms_selected_number = ";".join(self.sms_selected_recipients)
-        self.sms_thread_title.set_text("Chargement de la conversation…")
+        cached = self._read_sms_thread_cache(thread_id)
+        if cached:
+            self.sms_selected_recipients = cached.get("recipients") or self.sms_selected_recipients
+            self.sms_thread_is_group = bool(cached.get("is_group", self.sms_thread_is_group))
+            self._show_sms_thread_messages(cached.get("messages", []), from_cache=True)
+        else:
+            self.sms_thread_title.set_text("Chargement de la conversation…")
         self._run_adb_command(
             _content_query_args(
                 f"content://mms-sms/conversations/{int(thread_id)}",
@@ -4910,10 +5383,47 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             timeout=90,
         )
 
+    def _show_sms_thread_messages(self, messages, from_cache=False):
+        self.sms_messages = list(messages)
+        discovered_recipients = []
+        for message in self.sms_messages:
+            address = message.get("address", "")
+            if address and address.casefold() != "null" and address not in discovered_recipients:
+                discovered_recipients.append(address)
+        if not self.sms_selected_recipients:
+            self.sms_selected_recipients = discovered_recipients
+        self.sms_thread_is_group = self.sms_thread_is_group or len(self.sms_selected_recipients) > 1
+        if self.sms_messages:
+            if not self.sms_selected_recipients and self.sms_messages[-1].get("address"):
+                self.sms_selected_recipients = [self.sms_messages[-1]["address"]]
+            self.sms_selected_number = ";".join(self.sms_selected_recipients)
+            self.sms_number_entry.set_text(self.sms_selected_number)
+            conversation = next(
+                (item for item in self.sms_conversations if str(item["thread_id"]) == str(self.sms_selected_thread)),
+                None,
+            )
+            title = self._sms_conversation_label(conversation) if conversation else (
+                ", ".join(self._sms_display_name(number) for number in self.sms_selected_recipients)
+                or "Conversation SMS"
+            )
+            suffix = " · cache local" if from_cache else ""
+            self.sms_thread_title.set_text(f"{title} · {len(self.sms_messages)} messages{suffix}")
+            self.sms_recipient_label.set_text(
+                f"Répondre au groupe · {title}" if self.sms_thread_is_group else f"Répondre à {title}"
+            )
+        else:
+            self.sms_selected_number = ""
+            self.sms_thread_title.set_text("Conversation vide")
+            self.sms_recipient_label.set_text("Conversation vide")
+        self._render_sms_thread()
+
     def _sms_thread_result(self, result, error):
         if error or not result or result.returncode != 0:
             detail = error or ((result.stderr or result.stdout).strip() if result else "")
-            self.sms_thread_title.set_text("Conversation indisponible")
+            if self.sms_messages:
+                self.sms_thread_title.set_text(f"{self.sms_thread_title.get_text()} · cache conservé")
+            else:
+                self.sms_thread_title.set_text("Conversation indisponible")
             self._set_status(f"Impossible de lire cette conversation SMS : {detail}", True)
             return
         self.sms_messages = []
@@ -4941,34 +5451,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         message_count = len(self.sms_messages)
         if message_count > 300:
             self.sms_messages = self.sms_messages[-300:]
-        discovered_recipients = []
-        for message in self.sms_messages:
-            address = message["address"]
-            if address and address.casefold() != "null" and address not in discovered_recipients:
-                discovered_recipients.append(address)
-        if not self.sms_selected_recipients:
-            self.sms_selected_recipients = discovered_recipients
-        self.sms_thread_is_group = self.sms_thread_is_group or len(self.sms_selected_recipients) > 1
-        if self.sms_messages:
-            if not self.sms_selected_recipients and self.sms_messages[-1]["address"]:
-                self.sms_selected_recipients = [self.sms_messages[-1]["address"]]
-            self.sms_selected_number = ";".join(self.sms_selected_recipients)
-            self.sms_number_entry.set_text(self.sms_selected_number)
-            conversation = next(
-                (item for item in self.sms_conversations if str(item["thread_id"]) == str(self.sms_selected_thread)),
-                None,
-            )
-            title = self._sms_conversation_label(conversation) if conversation else (
-                ", ".join(self._sms_display_name(number) for number in self.sms_selected_recipients)
-                or "Conversation SMS"
-            )
-            self.sms_thread_title.set_text(f"{title} · {message_count} messages")
-            self.sms_recipient_label.set_text(f"Répondre au groupe · {title}" if self.sms_thread_is_group else f"Répondre à {title}")
-        else:
-            self.sms_selected_number = ""
-            self.sms_thread_title.set_text("Conversation vide")
-            self.sms_recipient_label.set_text("Conversation vide")
-        self._render_sms_thread()
+        self._show_sms_thread_messages(self.sms_messages)
+        self._save_sms_thread_cache(self.sms_selected_thread)
+        self._save_sms_conversations_cache()
         mms_ids = sorted({
             message["id"] for message in self.sms_messages
             if message["transport"] == "mms" and message["id"].isdigit()
@@ -4997,6 +5482,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             if message["transport"] == "mms" and message["id"].isdigit()
         }, key=int)
         if not mms_ids:
+            self._save_sms_thread_cache(self.sms_selected_thread)
             return
         where = f"mid IN ({','.join(mms_ids)})"
         self._run_adb_command(
@@ -5012,6 +5498,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 if message["transport"] == "mms" and not message["body"] and not message["subject"] and not message["media"]:
                     message["media"].append("MMS · pièces jointes non lisibles")
             self._render_sms_thread()
+            self._save_sms_thread_cache(self.sms_selected_thread)
             detail = error or ((result.stderr or result.stdout).strip() if result else "")
             self._set_status(
                 f"Le contenu détaillé de certains MMS n’est pas accessible : {detail[:180] or 'Android ne fournit pas les pièces.'}",
@@ -5040,6 +5527,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             if message["transport"] == "mms" and not message["body"] and not message["subject"] and not message["media"]:
                 message["media"].append("MMS · média sans texte")
         self._render_sms_thread()
+        self._save_sms_thread_cache(self.sms_selected_thread)
 
     def _render_sms_thread(self):
         while child := self.sms_thread_list.get_first_child():
@@ -5295,47 +5783,75 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.call_recording_enabled = switch.get_active()
         self._save_call_recording_enabled(self.call_recording_enabled)
         if self.call_recording_enabled:
-            self.call_recording_status.set_text(
-                "Enregistrement activé · il démarrera quand un appel sera relié au son du PC."
-            )
+            self.call_recording_card.remove_css_class("recording-disabled")
+            self.call_recording_status.set_text(self._call_recording_ready_message())
             self._maybe_start_call_recording()
         elif self.call_recording_process:
+            self.call_recording_card.add_css_class("recording-disabled")
             self.call_recording_status.set_text("Finalisation de l’enregistrement…")
             self._stop_call_recording()
         else:
-            self.call_recording_status.set_text("Enregistrement désactivé.")
+            self.call_recording_card.add_css_class("recording-disabled")
+            self.call_recording_status.set_text("Désactivé · aucun nouveau fichier ne sera créé.")
+
+    def _call_recording_directory(self):
+        music_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
+        return Path(music_dir or (Path.home() / "Music")) / "DroidDesk Calls"
+
+    def _call_recording_ready_message(self):
+        directory = self._call_recording_directory()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self.call_recording_issue = str(error)
+            return f"Activé · impossible de créer le dossier d’enregistrements : {error}"
+        return (
+            "Activé · attend un appel détecté par DroidDesk et le relais audio HFP. "
+            f"Fichiers Opus : {directory}."
+        )
+
+    def _open_call_recording_folder(self, *_args):
+        directory = self._call_recording_directory()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(str(directory)).get_uri(), None)
+        except (OSError, GLib.Error) as error:
+            self.call_recording_status.set_text(f"Dossier d’enregistrements indisponible · {error}")
+            self._set_status(f"Impossible d’ouvrir le dossier d’enregistrements : {error}", True)
 
     def _maybe_start_call_recording(self):
-        if not self.call_recording_enabled or not self.call_session_active:
+        if not self.call_recording_enabled:
+            return
+        if not self.call_session_active:
+            self.call_recording_status.set_text(self._call_recording_ready_message())
             return
         if self.call_recording_process:
             return
         if not self.call_audio_module_ids or not self.call_audio_record_sources:
             self.call_recording_status.set_text(
-                "Activé · l’enregistrement commencera quand l’audio HFP sera relié."
+                "Appel détecté · attente du relais audio HFP. Aucun fichier ne sera créé avant la liaison."
             )
             return
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            self.call_recording_status.set_text(
-                "Enregistrement impossible : installe ffmpeg pour capturer les deux sens de l’appel."
-            )
+            self.call_recording_issue = "FFmpeg est introuvable; installe ffmpeg pour enregistrer l’appel."
+            self.call_recording_status.set_text(f"Enregistrement impossible · {self.call_recording_issue}")
             return
         phone_source, microphone = self.call_audio_record_sources
-        music_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
-        directory = Path(music_dir or (Path.home() / "Music")) / "DroidDesk Calls"
+        directory = self._call_recording_directory()
         try:
             directory.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S-%f")
             number = re.sub(r"[^0-9+]+", "", self.number_entry.get_text())[:24]
             label = f" - {number}" if number else ""
-            path = directory / f"{timestamp} - {self.call_direction}{label}.wav"
+            path = directory / f"{timestamp} - {self.call_direction}{label}.opus"
             command = [
                 ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "pulse", "-i", phone_source,
                 "-f", "pulse", "-i", microphone,
                 "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=1:normalize=0[a]",
-                "-map", "[a]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(path),
+                "-map", "[a]", "-ar", "16000", "-ac", "1",
+                "-c:a", "libopus", "-b:a", "32k", "-application", "voip", str(path),
             ]
             process = subprocess.Popen(
                 command,
@@ -5345,29 +5861,34 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 text=True,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            self.call_recording_status.set_text(f"Enregistrement impossible : {error}")
+            self.call_recording_issue = str(error)
+            self.call_recording_status.set_text(f"Enregistrement impossible · {error}")
             return
+        self.call_recording_issue = ""
         self.call_recording_process = process
         self.call_recording_path = path
         self.call_recording_status.set_text(f"Démarrage de l’enregistrement · {path}")
-        GLib.timeout_add(500, self._call_recording_start_check, process, path)
+        GLib.timeout_add_seconds(1, self._call_recording_start_check, process, path)
 
     def _call_recording_start_check(self, process, path):
         if self.call_recording_process is not process:
             return GLib.SOURCE_REMOVE
         if process.poll() is None:
-            self.call_recording_status.set_text(f"● Enregistrement actif · {path}")
-            return GLib.SOURCE_REMOVE
+            message = f"● Enregistrement actif · {path}"
+            if self.call_recording_status.get_text() != message:
+                self.call_recording_status.set_text(message)
+            return GLib.SOURCE_CONTINUE
         _stdout, stderr = process.communicate()
         self.call_recording_process = None
         self.call_recording_path = None
         try:
-            if path.exists() and path.stat().st_size <= 44:
+            if path.exists() and path.stat().st_size < 128:
                 path.unlink()
         except OSError:
             pass
         detail = stderr.strip() or "ffmpeg s’est arrêté avant la capture audio."
-        self.call_recording_status.set_text(f"Enregistrement impossible : {detail}")
+        self.call_recording_issue = detail
+        self.call_recording_status.set_text(f"Enregistrement impossible · {detail}")
         self._set_status(f"Enregistrement d’appel impossible : {detail}", True)
         return GLib.SOURCE_REMOVE
 
@@ -5403,17 +5924,31 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _call_recording_stopped(self, path, error=""):
         if error:
-            self.call_recording_status.set_text(f"Enregistrement interrompu : {error}")
+            self.call_recording_issue = error
+            self.call_recording_status.set_text(f"Enregistrement interrompu · {error}")
         elif path:
-            self.call_recording_status.set_text(f"Enregistrement sauvegardé · {path}")
-            self._set_status(f"Appel enregistré : {path}")
+            try:
+                valid_file = path.is_file() and path.stat().st_size > 128
+            except OSError:
+                valid_file = False
+            if valid_file:
+                self.call_recording_issue = ""
+                self.call_recording_status.set_text(f"Enregistrement sauvegardé · {path}")
+                self._set_status(f"Appel enregistré : {path}")
+            else:
+                self.call_recording_issue = "Aucun son n’a été écrit par FFmpeg pendant l’appel."
+                self.call_recording_status.set_text(f"Aucun fichier audio valide · {self.call_recording_issue}")
+                self._set_status(self.call_recording_issue, True)
         else:
-            self.call_recording_status.set_text("Enregistrement désactivé.")
+            self.call_recording_status.set_text("Désactivé · aucun nouveau fichier ne sera créé.")
         return GLib.SOURCE_REMOVE
 
     def _schedule_call_audio_bridge(self):
-        self.call_audio_auto_retries = 3
+        self.call_audio_auto_retries = 10
         self.call_audio_should_stop = False
+        self.call_recording_issue = ""
+        if self.call_recording_enabled:
+            self.call_recording_status.set_text("Appel détecté · connexion du relais HFP avant le démarrage de l’enregistrement…")
         self.call_audio_status.set_text("Appel lancé. Connexion de l’audio HFP aux écouteurs du PC…")
         self._refresh_call_summary()
         if self.call_audio_module_ids and self.call_audio_record_sources:
@@ -5740,8 +6275,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 self.call_audio_auto_retries -= 1
                 self.call_audio_original_profile = original_profile
                 self.call_audio_status.set_text(
-                    f"Le profil mains libres démarre; nouvelle tentative ({3 - self.call_audio_auto_retries}/3)…"
+                    f"Le profil mains libres démarre; nouvelle tentative ({10 - self.call_audio_auto_retries}/10)…"
                 )
+                if self.call_recording_enabled and self.call_session_active:
+                    self.call_recording_status.set_text("Appel détecté · recherche du relais HFP avant l’enregistrement…")
                 self.call_audio_bluetooth_button.set_label("Connexion audio…")
                 self.call_audio_bluetooth_button.set_sensitive(False)
                 GLib.timeout_add(1500, self._start_call_audio_bridge)
@@ -5754,12 +6291,16 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.call_audio_bluetooth_button.set_sensitive(self._active_device() is not None and not self.busy)
             self._set_status(f"Audio d’appel non relié : {error}", True)
             self.call_audio_auto_retries = 0
+            if self.call_recording_enabled and self.call_session_active:
+                self.call_recording_issue = error
+                self.call_recording_status.set_text(f"Aucun fichier créé · audio HFP non relié : {error}")
             self._refresh_call_summary()
             return GLib.SOURCE_REMOVE
         self.call_audio_module_ids = module_ids
         self.call_audio_original_profile = original_profile
         self.call_audio_phone_card = card_name
         self.call_audio_record_sources = (phone_source_name, mic_name)
+        self.call_recording_issue = ""
         if self.call_audio_should_stop:
             self._stop_call_audio_bridge()
             return GLib.SOURCE_REMOVE
@@ -5836,14 +6377,23 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.call_audio_bluetooth_button.set_sensitive(self._active_device() is not None and not self.busy)
         self._refresh_call_summary()
         if recording_path:
+            try:
+                valid_file = recording_path.is_file() and recording_path.stat().st_size > 128
+            except OSError:
+                valid_file = False
+        else:
+            valid_file = False
+        if recording_path and valid_file:
             self.call_recording_status.set_text(f"Enregistrement sauvegardé · {recording_path}")
             self._set_status(f"Appel enregistré : {recording_path}")
         elif self.call_recording_enabled:
-            self.call_recording_status.set_text(
-                "Enregistrement activé · il démarrera quand un appel sera relié au son du PC."
+            detail = error or self.call_recording_issue or (
+                "Aucun fichier audio valide. Vérifie que l’appel a été détecté et que le relais HFP est relié."
             )
+            self.call_recording_issue = detail
+            self.call_recording_status.set_text(f"Aucun fichier créé · {detail}")
         else:
-            self.call_recording_status.set_text("Enregistrement désactivé.")
+            self.call_recording_status.set_text("Désactivé · aucun nouveau fichier ne sera créé.")
         return GLib.SOURCE_REMOVE
 
     def _command_status(self, result, error, success):
@@ -6497,6 +7047,36 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         except OSError:
             return
 
+    @staticmethod
+    def _write_private_cache_bytes(path, data):
+        root = Path(GLib.get_user_cache_dir()) / "droiddesk"
+        temporary = None
+        descriptor = None
+        try:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(root, 0o700)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            directory = path.parent
+            while directory != root and root in directory.parents:
+                os.chmod(directory, 0o700)
+                directory = directory.parent
+            descriptor, temporary = tempfile.mkstemp(prefix=".cache-", dir=path.parent)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = None
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
     def _on_apps_search(self, entry, *_args):
         self.app_search_text = entry.get_text().strip().casefold()
         self._render_apps()
@@ -6551,7 +7131,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if not packages:
             empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             empty.add_css_class("app-tile")
-            empty.set_size_request(180, 216)
+            empty.set_size_request(148, 176)
             empty.set_valign(Gtk.Align.START)
             empty_label = Gtk.Label(label="Aucune application trouvée")
             empty_label.add_css_class("heading")
@@ -6563,7 +7143,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         for package in packages:
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             tile.add_css_class("app-tile")
-            tile.set_size_request(180, 216)
+            tile.set_size_request(148, 176)
             tile.set_valign(Gtk.Align.START)
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             spacer = Gtk.Box()
@@ -6597,8 +7177,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             else:
                 icon = Gtk.Image()
                 icon.set_from_icon_name(self._app_icon(package))
-                icon.set_pixel_size(128)
-            icon.set_size_request(144, 144)
+                icon.set_pixel_size(96)
+            icon.set_size_request(96, 96)
             icon.set_halign(Gtk.Align.CENTER)
             icon.set_valign(Gtk.Align.CENTER)
             frame.append(icon)
@@ -6987,13 +7567,26 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.photos_status.set_text("Associe DroidLink, active le relais de notifications, puis autorise Photos dans l’application Android.")
             self._set_status("Associe d’abord DroidLink pour charger la galerie.", True)
             return
+        if not self.gallery_loaded:
+            cache_path = self._gallery_metadata_cache_path()
+            if cache_path:
+                try:
+                    cached_items = json.loads(cache_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    cached_items = None
+                if isinstance(cached_items, list) and cached_items:
+                    self._populate_photos_gallery(cached_items, from_cache=True)
         if not self.droidlink_bridge.enqueue_command("photo_list", ""):
             self._set_status("Impossible d’envoyer la demande de galerie.", True)
             return
-        self.photos_status.set_text("Lecture des photos récentes sur le téléphone…")
-        self._set_status("DroidLink prépare la galerie du téléphone…")
+        if self.gallery_loaded:
+            self.photos_status.set_text("Cache local affiché · actualisation des 2 000 photos en arrière-plan…")
+            self._set_status("Actualisation des métadonnées photo depuis le téléphone…")
+        else:
+            self.photos_status.set_text("Lecture des photos récentes sur le téléphone…")
+            self._set_status("DroidLink prépare la galerie du téléphone…")
 
-    def _populate_photos_gallery(self, items):
+    def _populate_photos_gallery(self, items, from_cache=False):
         child = self.photos_flow.get_first_child()
         while child:
             self.photos_flow.remove(child)
@@ -7005,7 +7598,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.gallery_loaded = True
         self.gallery_cards.clear()
         self.gallery_requested_thumbnails.clear()
+        self.gallery_requested_previews.clear()
+        self.gallery_ready_thumbnails.clear()
         self.gallery_thumbnail_cache_paths.clear()
+        self.gallery_preview_cache_paths.clear()
         self.gallery_thumbnail_cache_dir = self._gallery_cache_directory()
         self.gallery_selected = None
         for photo in self.gallery_photos:
@@ -7013,20 +7609,35 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             cache_path = self._gallery_thumbnail_cache_path(photo)
             if cache_path:
                 self.gallery_thumbnail_cache_paths[photo_id] = cache_path
+                self.gallery_preview_cache_paths[photo_id] = cache_path.with_name(f"{cache_path.stem}-preview.jpg")
             card = Gtk.Button()
             card.add_css_class("card")
-            card.set_size_request(250, 226)
-            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            content.set_margin_top(10)
-            content.set_margin_bottom(10)
-            content.set_margin_start(10)
-            content.set_margin_end(10)
-            thumbnail = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+            card.set_size_request(320, -1)
+            card.set_hexpand(True)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            content.set_hexpand(True)
+            content.set_margin_top(6)
+            content.set_margin_bottom(6)
+            content.set_margin_start(6)
+            content.set_margin_end(6)
+            thumbnail = Gtk.Picture.new()
+            thumbnail.set_can_shrink(True)
+            thumbnail.set_content_fit(Gtk.ContentFit.COVER)
             thumbnail.add_css_class("gallery-thumbnail")
-            thumbnail.set_pixel_size(88)
-            thumbnail.set_size_request(224, 174)
-            thumbnail.set_halign(Gtk.Align.CENTER)
-            content.append(thumbnail)
+            thumbnail.set_size_request(300, 260)
+            thumbnail.set_hexpand(True)
+            thumbnail.set_halign(Gtk.Align.FILL)
+            placeholder = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+            placeholder.set_pixel_size(72)
+            placeholder.add_css_class("gallery-thumbnail-placeholder")
+            placeholder.set_halign(Gtk.Align.CENTER)
+            placeholder.set_valign(Gtk.Align.CENTER)
+            thumbnail_frame = Gtk.Overlay()
+            thumbnail_frame.set_size_request(300, 260)
+            thumbnail_frame.set_hexpand(True)
+            thumbnail_frame.set_child(thumbnail)
+            thumbnail_frame.add_overlay(placeholder)
+            content.append(thumbnail_frame)
             name = Gtk.Label(label=photo.get("name") or "Image", xalign=0)
             name.set_ellipsize(Pango.EllipsizeMode.END)
             name.set_max_width_chars(28)
@@ -7035,14 +7646,35 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             card.set_child(content)
             card.connect("clicked", lambda _button, record=photo: self._select_gallery_photo(record))
             self.photos_flow.append(card)
-            self.gallery_cards[photo_id] = {"button": card, "image": thumbnail, "photo": photo}
+            self.gallery_cards[photo_id] = {
+                "button": card,
+                "image": thumbnail,
+                "placeholder": placeholder,
+                "photo": photo,
+            }
         self._prune_gallery_thumbnail_cache()
         count = len(self.gallery_photos)
-        self.photos_status.set_text(f"{count:,} / 2 000 photos récentes · chargement au défilement, puis cache local.".replace(",", " "))
+        self.gallery_visible_range = (0, min(36, count))
+        self.gallery_prefetch_queue = []
+        for index in range(min(36, count), count):
+            photo_id = int(self.gallery_photos[index]["id"])
+            thumbnail_path = self.gallery_thumbnail_cache_paths.get(photo_id)
+            preview_path = self.gallery_preview_cache_paths.get(photo_id)
+            if not (thumbnail_path and thumbnail_path.is_file()) and not (preview_path and preview_path.is_file()):
+                self.gallery_prefetch_queue.append(index)
+        self.gallery_prefetch_cursor = 0
+        self.photos_status.set_text(f"{count:,} / 2 000 photos · vignettes prioritaires, puis aperçu détaillé au défilement.".replace(",", " "))
         if count:
-            self._request_photo_thumbnails(0, min(36, count))
+            self._request_photo_thumbnails(0, min(36, count), request_remote=not from_cache)
+            self._request_photo_previews(0, min(36, count))
+            if not from_cache and self.gallery_prefetch_queue:
+                if self.gallery_prefetch_timer:
+                    GLib.source_remove(self.gallery_prefetch_timer)
+                self.gallery_prefetch_timer = GLib.timeout_add(2_600, self._gallery_prefetch_next_batch)
         else:
             self.photos_status.set_text("Aucune photo accessible. Vérifie l’autorisation média sur le téléphone.")
+        if not from_cache:
+            self._save_gallery_metadata_cache()
         self._update_controls()
 
     def _select_gallery_photo(self, photo):
@@ -7064,36 +7696,94 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if maximum <= 0:
             return
         first = int((adjustment.get_value() / maximum) * count)
-        self._request_photo_thumbnails(max(0, first - 12), min(48, count))
+        start = max(0, first - 12)
+        stop = min(count, start + 48)
+        self.gallery_visible_range = (start, stop)
+        self._request_photo_thumbnails(start, stop - start)
+        self._request_photo_previews(start, stop - start)
 
-    def _request_photo_thumbnails(self, start, count):
+    def _request_photo_thumbnails(self, start, count, request_remote=True):
         stop = min(len(self.gallery_photos), start + count)
         for photo in self.gallery_photos[start:stop]:
             photo_id = int(photo["id"])
             if photo_id in self.gallery_requested_thumbnails:
                 continue
+            if self._load_cached_gallery_preview(photo_id):
+                continue
             if self._load_cached_gallery_thumbnail(photo_id):
+                continue
+            if not request_remote:
                 continue
             if not self.droidlink_bridge or not self.droidlink_bridge.snapshot()["paired"]:
                 continue
             if self.droidlink_bridge.enqueue_command("photo_thumbnail", "", photoId=photo_id):
                 self.gallery_requested_thumbnails.add(photo_id)
 
-    def _gallery_cache_directory(self):
-        state = self.droidlink_bridge.snapshot() if self.droidlink_bridge else {"phone": {}}
-        phone = state.get("phone", {})
-        identity = "|".join(
-            str(phone.get(key, "")).strip()
-            for key in ("manufacturer", "model", "android")
-            if phone.get(key)
+    def _request_photo_previews(self, start, count):
+        stop = min(len(self.gallery_photos), start + count)
+        for photo in self.gallery_photos[start:stop]:
+            photo_id = int(photo["id"])
+            if photo_id in self.gallery_requested_previews:
+                continue
+            if self._load_cached_gallery_preview(photo_id):
+                continue
+            if photo_id not in self.gallery_ready_thumbnails:
+                continue
+            if not self.droidlink_bridge or not self.droidlink_bridge.snapshot()["paired"]:
+                continue
+            if self.droidlink_bridge.enqueue_command("photo_preview", "", photoId=photo_id):
+                self.gallery_requested_previews.add(photo_id)
+
+    def _gallery_prefetch_next_batch(self):
+        self.gallery_prefetch_timer = 0
+        if not self.gallery_loaded or self.gallery_prefetch_cursor >= len(self.gallery_prefetch_queue):
+            return GLib.SOURCE_REMOVE
+        stop = min(len(self.gallery_prefetch_queue), self.gallery_prefetch_cursor + 20)
+        for index in self.gallery_prefetch_queue[self.gallery_prefetch_cursor:stop]:
+            self._request_photo_thumbnails(index, 1)
+        self.gallery_prefetch_cursor = stop
+        self._update_gallery_loading_status()
+        if stop < len(self.gallery_prefetch_queue):
+            self.gallery_prefetch_timer = GLib.timeout_add(2_600, self._gallery_prefetch_next_batch)
+        else:
+            self.photos_status.set_text(
+                f"Vignettes envoyées pour {len(self.gallery_photos):,} photos · les aperçus détaillés suivent à l’écran.".replace(",", " ")
+            )
+        return GLib.SOURCE_REMOVE
+
+    def _update_gallery_loading_status(self):
+        count = len(self.gallery_photos)
+        ready = len(self.gallery_ready_thumbnails)
+        self.photos_status.set_text(
+            f"{count:,} photos · miniatures {ready}/{count} · aperçu détaillé au défilement…".replace(",", " ")
         )
-        if not identity:
-            active = self._active_device()
-            identity = active[0] if active else ""
+
+    def _gallery_cache_directory(self):
+        identity = self._phone_cache_identity()
         if not identity:
             return None
         phone_key = hashlib.sha256(identity.casefold().encode("utf-8")).hexdigest()[:20]
         return Path(GLib.get_user_cache_dir()) / "droiddesk" / "gallery" / phone_key
+
+    def _gallery_metadata_cache_path(self):
+        directory = self._gallery_cache_directory()
+        return directory / "photos.json" if directory else None
+
+    def _save_gallery_metadata_cache(self):
+        path = self._gallery_metadata_cache_path()
+        if not path:
+            return
+        items = [
+            {
+                key: photo.get(key, "")
+                for key in ("id", "path", "name", "date", "size")
+            }
+            for photo in self.gallery_photos[:2_000]
+        ]
+        self._write_private_cache_bytes(
+            path,
+            json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
 
     def _gallery_thumbnail_cache_path(self, photo):
         if not self.gallery_thumbnail_cache_dir:
@@ -7114,8 +7804,14 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         directory = self.gallery_thumbnail_cache_dir
         if not directory or not directory.is_dir():
             return
-        keep = {path.name for path in self.gallery_thumbnail_cache_paths.values()}
         try:
+            keep = {path.name for path in self.gallery_thumbnail_cache_paths.values()}
+            previews = sorted(
+                directory.glob("*-preview.jpg"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            keep.update(path.name for path in previews[:200])
             for path in directory.glob("*.jpg"):
                 if path.name not in keep:
                     path.unlink(missing_ok=True)
@@ -7130,11 +7826,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return loader.get_pixbuf()
 
     @staticmethod
-    def _fit_pixbuf(pixbuf, width, height):
-        ratio = min(width / pixbuf.get_width(), height / pixbuf.get_height())
-        target_width = max(1, round(pixbuf.get_width() * ratio))
-        target_height = max(1, round(pixbuf.get_height() * ratio))
-        return pixbuf.scale_simple(target_width, target_height, GdkPixbuf.InterpType.HYPER)
+    def _set_gallery_thumbnail(card, pixbuf):
+        card["image"].set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+        card["placeholder"].set_visible(False)
 
     def _load_cached_gallery_thumbnail(self, photo_id):
         path = self.gallery_thumbnail_cache_paths.get(photo_id)
@@ -7151,8 +7845,34 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         card = self.gallery_cards.get(photo_id)
         if not card or not pixbuf:
             return False
-        card["image"].set_from_pixbuf(self._fit_pixbuf(pixbuf, 224, 174))
+        self._set_gallery_thumbnail(card, pixbuf)
+        self.gallery_ready_thumbnails.add(photo_id)
         self.gallery_requested_thumbnails.add(photo_id)
+        return True
+
+    def _load_cached_gallery_preview(self, photo_id):
+        path = self.gallery_preview_cache_paths.get(photo_id)
+        if not path or not path.is_file():
+            return False
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
+        except (OSError, GLib.Error):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        card = self.gallery_cards.get(photo_id)
+        if not card or not pixbuf:
+            return False
+        self._set_gallery_thumbnail(card, pixbuf)
+        try:
+            path.touch()
+        except OSError:
+            pass
+        self.gallery_ready_thumbnails.add(photo_id)
+        self.gallery_requested_thumbnails.add(photo_id)
+        self.gallery_requested_previews.add(photo_id)
         return True
 
     def _display_photo_thumbnail(self, event):
@@ -7163,11 +7883,34 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             pixbuf = self._read_pixbuf(data)
             card = self.gallery_cards.get(photo_id)
             if card and pixbuf:
-                card["image"].set_from_pixbuf(self._fit_pixbuf(pixbuf, 224, 174))
+                self._set_gallery_thumbnail(card, pixbuf)
             path = self.gallery_thumbnail_cache_paths.get(photo_id)
             if path and pixbuf:
-                self._write_cached_bytes(path, data)
+                self._write_private_cache_bytes(path, data)
+                self.gallery_ready_thumbnails.add(photo_id)
                 self.gallery_requested_thumbnails.add(photo_id)
+                start, stop = self.gallery_visible_range
+                if any(int(photo.get("id", 0)) == photo_id for photo in self.gallery_photos[start:stop]):
+                    self._request_photo_previews(start, stop - start)
+                if len(self.gallery_ready_thumbnails) % 20 == 0:
+                    self._update_gallery_loading_status()
+        except (ValueError, TypeError, GLib.Error):
+            return
+
+    def _display_photo_preview(self, event):
+        try:
+            photo_id = int(event.get("id", 0))
+            encoded = event.get("jpeg", "")
+            data = base64.b64decode(encoded, validate=True)
+            pixbuf = self._read_pixbuf(data)
+            card = self.gallery_cards.get(photo_id)
+            if card and pixbuf:
+                self._set_gallery_thumbnail(card, pixbuf)
+            path = self.gallery_preview_cache_paths.get(photo_id)
+            if path and pixbuf:
+                self._write_private_cache_bytes(path, data)
+                self.gallery_requested_previews.add(photo_id)
+                self._prune_gallery_thumbnail_cache()
         except (ValueError, TypeError, GLib.Error):
             return
 

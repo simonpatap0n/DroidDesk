@@ -1,5 +1,6 @@
 """Local HTTP bridge used by the DroidLink Android companion."""
 
+import hashlib
 import json
 import os
 import re
@@ -138,10 +139,12 @@ class DroidLinkBridge:
             seconds = max(0, int(self.code_expires - time.monotonic())) if self.code else 0
             if self.code and seconds == 0:
                 self.code = None
+            cache_id = hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:24] if self.token else ""
             return {
                 "code": self.code,
                 "seconds": seconds,
                 "paired": self.token is not None,
+                "cache_id": cache_id,
                 "phone": dict(self.phone),
             }
 
@@ -298,13 +301,14 @@ class DroidLinkBridge:
                             "path": path,
                         })
                 event = {"type": event_type, "items": items}
-            elif event_type in ("photo_thumbnail", "photo_thumbnail_error"):
+            elif event_type in ("photo_thumbnail", "photo_thumbnail_error", "photo_preview", "photo_preview_error"):
                 image_id = self._bounded_int(payload.get("id", 0), 0, 2**63 - 1)
                 event = {"type": event_type, "id": image_id}
-                if event_type == "photo_thumbnail":
+                if event_type in ("photo_thumbnail", "photo_preview"):
                     encoded = str(payload.get("jpeg", ""))
-                    if len(encoded) > 64_000 or not all(char.isalnum() or char in "+/=-_" for char in encoded):
-                        self._respond(handler, 400, {"error": "Vignette invalide."})
+                    maximum = 64_000 if event_type == "photo_thumbnail" else 700_000
+                    if len(encoded) > maximum or not all(char.isalnum() or char in "+/=-_" for char in encoded):
+                        self._respond(handler, 400, {"error": "Image invalide."})
                         return
                     event["jpeg"] = encoded
                 else:
