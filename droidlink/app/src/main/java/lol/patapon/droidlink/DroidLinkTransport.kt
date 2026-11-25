@@ -27,6 +27,25 @@ internal object DroidLinkTransport {
         return "${baseUrl(context)}/v1/sessions/$sessionId/$route"
     }
 
+    private fun sessionRoute(route: String): String = "/v1/sessions/{id}/${route.substringBefore('?')}"
+
+    fun checkHealth(context: Context): Boolean {
+        val connection = URL("${baseUrl(context)}/healthz").openConnection() as HttpURLConnection
+        return try {
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 4_000
+            connection.readTimeout = 5_000
+            val status = connection.responseCode
+            RelayDiagnostics.recordResponse("GET /healthz", status)
+            status in 200..299
+        } catch (error: Exception) {
+            RelayDiagnostics.recordFailure("GET /healthz", error)
+            false
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     fun post(context: Context, token: String, route: String, payload: JSONObject, timeoutMs: Int = 8_000): Int {
         val endpoint = sessionUrl(context, route) ?: return 0
         val connection = URL(endpoint).openConnection() as HttpURLConnection
@@ -38,8 +57,11 @@ internal object DroidLinkTransport {
             connection.setRequestProperty("Authorization", "Bearer $token")
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            connection.responseCode
-        } catch (_: Exception) {
+            val status = connection.responseCode
+            RelayDiagnostics.recordResponse("POST ${sessionRoute(route)}", status)
+            status
+        } catch (error: Exception) {
+            RelayDiagnostics.recordFailure("POST ${sessionRoute(route)}", error)
             0
         } finally {
             connection.disconnect()
@@ -54,10 +76,13 @@ internal object DroidLinkTransport {
             connection.connectTimeout = 4_000
             connection.readTimeout = 24_000
             connection.setRequestProperty("Authorization", "Bearer $token")
-            if (connection.responseCode !in 200..299) return null
+            val status = connection.responseCode
+            RelayDiagnostics.recordResponse("GET ${sessionRoute("commands")}", status)
+            if (status !in 200..299) return null
             val response = connection.inputStream.bufferedReader().use { it.readText() }
             JSONObject(response).optJSONArray("commands") ?: JSONArray()
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            RelayDiagnostics.recordFailure("GET ${sessionRoute("commands")}", error)
             null
         } finally {
             connection.disconnect()

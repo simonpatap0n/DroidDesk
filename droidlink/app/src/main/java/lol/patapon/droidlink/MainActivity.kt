@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.provider.Telephony
 import android.provider.Settings
 import android.provider.Settings.Secure
+import android.text.format.DateFormat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -78,11 +79,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Date
 
 private const val PREFS = "droidlink"
 private const val TOKEN_KEY = "session_token"
@@ -386,8 +389,24 @@ private fun DeviceCard(context: Context) {
 
 @Composable
 private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGranted: Boolean, onEnable: () -> Unit) {
+    val context = LocalContext.current
+    val diagnostics by RelayDiagnostics.state.collectAsState()
+    val relayUrl = remember(context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
+            .orEmpty()
+            .trimEnd('/')
+    }
+    LaunchedEffect(context) {
+        while (true) {
+            withContext(Dispatchers.IO) { DroidLinkTransport.checkHealth(context) }
+            delay(15_000)
+        }
+    }
+
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Alertes", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        RelayDiagnosticsPanel(diagnostics, relayUrl)
         if (!paired) {
             FeatureCard(Icons.Outlined.Link, "Associer d’abord DroidDesk", "Le relais HTTPS doit être configuré et joignable.", "Accueil") { }
         } else if (!accessGranted) {
@@ -402,6 +421,65 @@ private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGrant
             }
         }
         Text("Les notifications restent sur le téléphone si le relais est indisponible.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun RelayDiagnosticsPanel(state: RelayDiagnosticsState, relayUrl: String) {
+    val context = LocalContext.current
+    val lightColor = when (state.reachable) {
+        true -> Color(0xFF2E9B55)
+        false -> MaterialTheme.colorScheme.error
+        null -> MaterialTheme.colorScheme.outline
+    }
+    val status = when (state.reachable) {
+        true -> "Serveur joignable"
+        false -> "Serveur inaccessible"
+        null -> "Vérification en cours…"
+    }
+
+    ElevatedCard(shape = RoundedCornerShape(24.dp)) {
+        Column(
+            Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(13.dp).background(lightColor, CircleShape))
+                Spacer(Modifier.width(10.dp))
+                Text(status, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            }
+            Text(relayUrl, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Journal de communication", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            if (state.entries.isEmpty()) {
+                Text("En attente du premier échange avec le relais.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                state.entries.take(8).forEach { entry ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            DateFormat.getTimeFormat(context).format(Date(entry.timestampMs)),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        val entryColor = when (entry.success) {
+                            true -> MaterialTheme.colorScheme.onSurfaceVariant
+                            false -> MaterialTheme.colorScheme.error
+                            null -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        Text(
+                            entry.message,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = entryColor,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -626,6 +704,7 @@ private suspend fun requestPairing(context: Context, code: String): PairingResul
             .toString()
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         val status = connection.responseCode
+        RelayDiagnostics.recordResponse("POST /v1/pair", status)
         val stream = if (status in 200..299) connection.inputStream else connection.errorStream
         val response = stream?.bufferedReader()?.use { it.readText() }?.let(::JSONObject)
         val token = response?.optString("token")?.takeIf { it.isNotBlank() && it != "null" }
@@ -640,7 +719,8 @@ private suspend fun requestPairing(context: Context, code: String): PairingResul
         } else {
             PairingResult(error = response?.optString("error")?.takeIf { it.isNotBlank() } ?: "Code refusé. Vérifie qu’il est encore valide.")
         }
-    } catch (_: Exception) {
+    } catch (error: Exception) {
+        RelayDiagnostics.recordFailure("POST /v1/pair", error)
         PairingResult(error = "Relais DroidLink inaccessible. Vérifie le DNS, HTTPS et le code affiché sur le PC.")
     } finally {
         connection.disconnect()
@@ -660,8 +740,9 @@ private suspend fun requestUnpair(context: Context, token: String, sessionId: St
         connection.setRequestProperty("Authorization", "Bearer $token")
         connection.setRequestProperty("Content-Type", "application/json")
         connection.outputStream.use { it.write("{}".toByteArray()) }
-        connection.responseCode
-    } catch (_: Exception) {
+        RelayDiagnostics.recordResponse("POST /v1/sessions/{id}/unpair", connection.responseCode)
+    } catch (error: Exception) {
+        RelayDiagnostics.recordFailure("POST /v1/sessions/{id}/unpair", error)
         // Local credentials are still cleared if the relay is offline.
     } finally {
         connection.disconnect()

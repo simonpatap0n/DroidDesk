@@ -207,35 +207,51 @@ class NotificationRelayService : NotificationListenerService() {
             return
         }
 
-        val activeBefore = runCatching {
-            getActiveNotifications().orEmpty().any { it.key == key }
-        }.getOrElse {
+        dismissNotificationAttempt(token, key, 1)
+    }
+
+    private fun dismissNotificationAttempt(token: String, key: String, attempt: Int) {
+        val active = try {
+            getActiveNotifications().orEmpty().firstOrNull { it.key == key }
+        } catch (_: Exception) {
             reportCommandResult(token, "dismiss", key, false, "Accès aux notifications Android indisponible.")
             return
         }
-        if (!activeBefore) {
+
+        if (active == null) {
             reportCommandResult(token, "dismiss", key, true, "La notification était déjà absente.")
             return
         }
+        if (!active.isClearable) {
+            reportCommandResult(token, "dismiss", key, false, "Android marque cette notification comme persistante; DroidLink ne peut pas la supprimer.")
+            return
+        }
 
-        runCatching { cancelNotification(key) }.onFailure {
+        try {
+            cancelNotification(key)
+        } catch (_: Exception) {
             reportCommandResult(token, "dismiss", key, false, "Android a refusé la suppression de la notification.")
             return
         }
 
         executor.schedule({
-            val stillActive = runCatching {
-                getActiveNotifications().orEmpty().any { it.key == key }
-            }.getOrElse { true }
-            if (stillActive) {
-                reportCommandResult(token, "dismiss", key, false, "La notification est toujours active sur le téléphone.")
-            } else {
-                reportCommandResult(token, "dismiss", key, true, "Notification supprimée sur Android.")
+            val stillActive = try {
+                getActiveNotifications().orEmpty().firstOrNull { it.key == key }
+            } catch (_: Exception) {
+                reportCommandResult(token, "dismiss", key, false, "Impossible de vérifier la suppression sur Android.")
+                return@schedule
             }
-        }, 700, java.util.concurrent.TimeUnit.MILLISECONDS)
+            when {
+                stillActive == null -> reportCommandResult(token, "dismiss", key, true, "Notification supprimée sur Android.")
+                !stillActive.isClearable -> reportCommandResult(token, "dismiss", key, false, "Android marque cette notification comme persistante; DroidLink ne peut pas la supprimer.")
+                attempt < MAX_DISMISS_ATTEMPTS -> dismissNotificationAttempt(token, key, attempt + 1)
+                else -> reportCommandResult(token, "dismiss", key, false, "La notification reste active ou est republiée après plusieurs tentatives.")
+            }
+        }, DISMISS_VERIFY_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     private fun reportCommandResult(token: String, action: String, key: String, success: Boolean, message: String) {
+        RelayDiagnostics.recordNote(message, success)
         val event = JSONObject()
             .put("type", "command_result")
             .put("action", action)
@@ -278,6 +294,8 @@ class NotificationRelayService : NotificationListenerService() {
     companion object {
         private const val PREFERENCES = "droidlink"
         private const val SESSION_TOKEN = "session_token"
+        private const val MAX_DISMISS_ATTEMPTS = 3
+        private const val DISMISS_VERIFY_DELAY_MS = 1_200L
         private const val KNOWN_APPS = "known_notification_apps"
         private const val BLOCKED_APPS = "blocked_notification_apps"
     }

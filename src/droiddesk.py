@@ -4,6 +4,7 @@
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 import posixpath
 import re
@@ -13,6 +14,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -76,6 +78,12 @@ APP_CSS = """
 .droiddesk-window .notification-mini-text {
   color: @dim_label_fg_color;
   font-size: 0.9em;
+}
+.droiddesk-window .droidlink-relay-card {
+  padding: 14px;
+  border: 1px solid @borders;
+  border-radius: 14px;
+  background-color: @card_bg_color;
 }
 .droiddesk-window .connection-indicator {
   min-width: 34px;
@@ -432,14 +440,19 @@ def _content_rows(output):
         for index, field in enumerate(fields):
             start = field.end()
             end = fields[index + 1].start() if index + 1 < len(fields) else len(prefix)
-            item[field.group(1)] = prefix[start:end].strip().strip("'\"")
+            item[field.group(1)] = _clean_adb_cell(prefix[start:end].strip().strip("'\""))
         if tail_match:
             value = text[tail_match.end():].strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
-            item[tail_match.group(1)] = value
+            item[tail_match.group(1)] = _clean_adb_cell(value)
         rows.append(item)
     return rows
+
+
+def _clean_adb_cell(value):
+    value = str(value or "").strip()
+    return "" if value.casefold() == "null" else value
 
 
 def _sms_rows(output):
@@ -469,12 +482,12 @@ def _sms_rows(output):
         for index, field in enumerate(fields):
             start = field.end()
             end = fields[index + 1].start() if index + 1 < len(fields) else len(prefix)
-            item[field.group(1)] = prefix[start:end].strip().strip("'")
+            item[field.group(1)] = _clean_adb_cell(prefix[start:end].strip().strip("'\""))
         if body_match:
             body = text[body_match.end():].strip()
             if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
                 body = body[1:-1]
-            item[body_match.group(1)] = body
+            item[body_match.group(1)] = _clean_adb_cell(body)
         result.append(item)
     return result
 
@@ -751,6 +764,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.gallery_prefetch_queue = []
         self.gallery_prefetch_timer = 0
         self.gallery_selected = None
+        self.gallery_viewer_index = -1
+        self.gallery_viewer_generation = 0
+        self.gallery_viewer_tempdir = None
         self.phone_preview_serial = None
         self.phone_preview_generation = 0
         self.busy = False
@@ -814,7 +830,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         reconnect_content.append(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
         reconnect_content.append(Gtk.Label(label="Reconnecter"))
         self.adb_reconnect_button.set_child(reconnect_content)
-        self.adb_reconnect_button.set_tooltip_text("Reconnecter le téléphone avec ADB sans fil")
+        self.adb_reconnect_button.set_tooltip_text(
+            "Rechercher et reconnecter les téléphones ADB appairés détectés par mDNS sur ce Wi-Fi"
+        )
         self.adb_reconnect_button.connect("clicked", self._reconnect_adb)
         header.pack_start(self.adb_reconnect_button)
 
@@ -873,7 +891,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         toolbar.add_top_bar(header)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        content = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.navigation_paned = content
+        self.navigation_position_save_source = 0
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_hexpand(True)
         self.stack.set_vexpand(True)
@@ -882,7 +902,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.tool_buttons = {}
         self.navigation_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.navigation_panel.add_css_class("app-sidebar")
-        self.navigation_panel.set_size_request(268, -1)
+        self.navigation_panel.set_size_request(210, -1)
 
         brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         brand.add_css_class("navigation-brand")
@@ -975,7 +995,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         navigation_scroll = Gtk.ScrolledWindow()
         navigation_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        navigation_scroll.set_min_content_width(268)
+        navigation_scroll.set_min_content_width(210)
+        navigation_scroll.set_max_content_width(560)
         navigation_scroll.set_vexpand(True)
         navigation_scroll.set_child(self.navigation_panel)
 
@@ -1021,8 +1042,14 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         main_panel.append(self.primary_tabs)
         main_panel.append(self.stack)
 
-        content.append(navigation_scroll)
-        content.append(main_panel)
+        content.set_start_child(navigation_scroll)
+        content.set_end_child(main_panel)
+        content.set_resize_start_child(False)
+        content.set_resize_end_child(True)
+        content.set_shrink_start_child(True)
+        content.set_shrink_end_child(True)
+        content.set_position(self._load_navigation_pane_width())
+        content.connect("notify::position", self._navigation_pane_position_changed)
         root.append(content)
 
         self.status_label = Gtk.Label(label="Connexion à ADB…", xalign=0)
@@ -1116,6 +1143,32 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             "DroidLink",
             "Compagnon Android : notifications et actions dans GNOME, batterie, photos et vraies icônes. Les appels et SMS restent dans leurs applications Android habituelles.",
         ))
+
+        relay_diagnostics = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        relay_diagnostics.add_css_class("droidlink-relay-card")
+        relay_status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
+        self.droidlink_relay_indicator = Gtk.Label(label="●")
+        self.droidlink_relay_indicator.set_use_markup(True)
+        self.droidlink_relay_status = Gtk.Label(label="Vérification du relais…", xalign=0)
+        self.droidlink_relay_status.add_css_class("heading")
+        relay_status_row.append(self.droidlink_relay_indicator)
+        relay_status_row.append(self.droidlink_relay_status)
+        relay_diagnostics.append(relay_status_row)
+        self.droidlink_relay_url = Gtk.Label(label="", xalign=0)
+        self.droidlink_relay_url.add_css_class("dim-label")
+        relay_diagnostics.append(self.droidlink_relay_url)
+        relay_log_heading = Gtk.Label(label="Journal de communication", xalign=0)
+        relay_log_heading.add_css_class("heading")
+        relay_diagnostics.append(relay_log_heading)
+        self.droidlink_relay_log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._droidlink_log_snapshot = None
+        relay_log_scroll = Gtk.ScrolledWindow()
+        relay_log_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        relay_log_scroll.set_min_content_height(100)
+        relay_log_scroll.set_max_content_height(150)
+        relay_log_scroll.set_child(self.droidlink_relay_log_box)
+        relay_diagnostics.append(relay_log_scroll)
+        page.append(relay_diagnostics)
 
         pairing = Adw.PreferencesGroup.new()
         pairing.set_title("Téléphone compagnon")
@@ -1236,7 +1289,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         page = self._page()
         page.append(self._heading(
             "Messages",
-            "SMS et MMS lus depuis le téléphone. Google Messages ne publie pas l’historique RCS, y compris les discussions chiffrées, dans la base Android accessible à DroidDesk.",
+            "DroidDesk lit les SMS/MMS exposés par Android et rapproche les numéros des contacts. Google Messages garde l’historique RCS dans sa base privée; Android ne le fournit pas au lecteur SMS/MMS.",
         ))
         self.sms_status = Gtk.Label(label="Lecture des messages enregistrés sur Android…", xalign=0)
         self.sms_status.add_css_class("dim-label")
@@ -1254,6 +1307,12 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         sidebar_title.add_css_class("heading")
         sidebar_title.set_hexpand(True)
         sidebar_header.append(sidebar_title)
+        self.sms_google_messages_button = Gtk.Button(label="RCS")
+        self.sms_google_messages_button.set_tooltip_text(
+            "Afficher Google Messages dans l’écran intégré de DroidDesk"
+        )
+        self.sms_google_messages_button.connect("clicked", self._open_google_messages_in_droiddesk)
+        sidebar_header.append(self.sms_google_messages_button)
         self.sms_new_button = Gtk.Button.new_from_icon_name("document-new-symbolic")
         self.sms_new_button.set_tooltip_text("Nouveau SMS")
         self.sms_new_button.connect("clicked", self._start_new_sms)
@@ -1290,6 +1349,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_thread_title = Gtk.Label(label="Choisis une conversation", xalign=0)
         self.sms_thread_title.add_css_class("heading")
         detail.append(self.sms_thread_title)
+        self.sms_participants_label = Gtk.Label(label="", xalign=0)
+        self.sms_participants_label.add_css_class("dim-label")
+        self.sms_participants_label.set_wrap(True)
+        self.sms_participants_label.set_visible(False)
+        detail.append(self.sms_participants_label)
         self.sms_thread_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.sms_thread_list.set_margin_top(8)
         self.sms_thread_list.set_margin_bottom(8)
@@ -1305,7 +1369,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         workspace.set_end_child(detail)
         workspace.set_resize_end_child(True)
         workspace.set_shrink_end_child(True)
-        workspace.set_position(250)
+        workspace.set_position(320)
         page.append(workspace)
 
         compose = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1467,7 +1531,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         wireless = Adw.PreferencesGroup.new()
         wireless.set_title("Débogage sans fil")
-        wireless.set_description("Sur Android 11+, ouvrez Débogage sans fil et utilisez les codes affichés par le téléphone.")
+        wireless.set_description(
+            "Sur Android 11+, appaire le téléphone une fois avec le code affiché. Ensuite, mDNS retrouve son port de connexion sur le même Wi-Fi."
+        )
         self.adb_wifi_settings_button = Gtk.Button(label="Ouvrir")
         self.adb_wifi_settings_button.connect("clicked", self._open_android_wifi_settings)
         wifi_settings_row = Adw.ActionRow.new()
@@ -1991,7 +2057,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.apps_grid = Gtk.FlowBox()
         self.apps_grid.set_selection_mode(Gtk.SelectionMode.NONE)
         self.apps_grid.set_homogeneous(True)
-        self.apps_grid.set_min_children_per_line(2)
+        self.apps_grid.set_min_children_per_line(4)
         self.apps_grid.set_max_children_per_line(4)
         self.apps_grid.set_row_spacing(10)
         self.apps_grid.set_column_spacing(10)
@@ -2017,7 +2083,12 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _build_gallery_page(self):
         page = self._page()
-        page.append(self._heading("Galerie", "Les 2 000 photos les plus récentes du téléphone."))
+        self.gallery_view_stack = Gtk.Stack()
+        self.gallery_view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.gallery_view_stack.set_vexpand(True)
+        browser = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        browser.set_vexpand(True)
+        browser.append(self._heading("Galerie", "Les 2 000 photos les plus récentes du téléphone."))
         gallery_group = Adw.PreferencesGroup.new()
         gallery_group.set_title("Photos récentes · maximum 2 000")
         gallery_group.set_description("Aperçus agrandis · les vignettes téléchargées restent en cache sur cet ordinateur.")
@@ -2042,7 +2113,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.photos_flow = Gtk.FlowBox()
         self.photos_flow.set_selection_mode(Gtk.SelectionMode.NONE)
         self.photos_flow.set_homogeneous(True)
-        self.photos_flow.set_min_children_per_line(1)
+        self.photos_flow.set_min_children_per_line(3)
         self.photos_flow.set_max_children_per_line(3)
         self.photos_flow.set_row_spacing(8)
         self.photos_flow.set_column_spacing(8)
@@ -2053,8 +2124,64 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.photos_scroll.set_child(self.photos_flow)
         self.photos_scroll.get_vadjustment().connect("value-changed", self._gallery_scroll_changed)
         gallery_group.add(self.photos_scroll)
-        page.append(gallery_group)
+        browser.append(gallery_group)
+        self.gallery_view_stack.add_named(browser, "browser")
+        self.gallery_view_stack.add_named(self._build_gallery_viewer(), "viewer")
+        page.append(self.gallery_view_stack)
         return page
+
+    def _build_gallery_viewer(self):
+        viewer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        viewer.set_vexpand(True)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        back = Gtk.Button.new_from_icon_name("go-previous-symbolic")
+        back.set_tooltip_text("Retour à la galerie")
+        back.connect("clicked", self._close_gallery_viewer)
+        toolbar.append(back)
+        self.gallery_viewer_title = Gtk.Label(label="Photo", xalign=0)
+        self.gallery_viewer_title.add_css_class("heading")
+        self.gallery_viewer_title.set_hexpand(True)
+        self.gallery_viewer_title.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        toolbar.append(self.gallery_viewer_title)
+        self.gallery_viewer_delete_button = Gtk.Button(label="Supprimer")
+        self.gallery_viewer_delete_button.set_icon_name("user-trash-symbolic")
+        self.gallery_viewer_delete_button.add_css_class("destructive-action")
+        self.gallery_viewer_delete_button.connect("clicked", self._confirm_gallery_photo_delete)
+        toolbar.append(self.gallery_viewer_delete_button)
+        viewer.append(toolbar)
+
+        self.gallery_viewer_picture = Gtk.Picture.new()
+        self.gallery_viewer_picture.set_can_shrink(True)
+        self.gallery_viewer_picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.gallery_viewer_picture.set_hexpand(True)
+        self.gallery_viewer_picture.set_vexpand(True)
+        self.gallery_viewer_picture.add_css_class("gallery-viewer-picture")
+        image_area = Gtk.Overlay()
+        image_area.set_hexpand(True)
+        image_area.set_vexpand(True)
+        image_area.add_css_class("card")
+        image_area.set_child(self.gallery_viewer_picture)
+        self.gallery_viewer_previous_button = Gtk.Button.new_from_icon_name("go-previous-symbolic")
+        self.gallery_viewer_previous_button.add_css_class("osd")
+        self.gallery_viewer_previous_button.set_tooltip_text("Photo précédente")
+        self.gallery_viewer_previous_button.connect("clicked", self._gallery_viewer_previous)
+        self.gallery_viewer_previous_button.set_halign(Gtk.Align.START)
+        self.gallery_viewer_previous_button.set_valign(Gtk.Align.CENTER)
+        self.gallery_viewer_previous_button.set_margin_start(12)
+        image_area.add_overlay(self.gallery_viewer_previous_button)
+        self.gallery_viewer_next_button = Gtk.Button.new_from_icon_name("go-next-symbolic")
+        self.gallery_viewer_next_button.add_css_class("osd")
+        self.gallery_viewer_next_button.set_tooltip_text("Photo suivante")
+        self.gallery_viewer_next_button.connect("clicked", self._gallery_viewer_next)
+        self.gallery_viewer_next_button.set_halign(Gtk.Align.END)
+        self.gallery_viewer_next_button.set_valign(Gtk.Align.CENTER)
+        self.gallery_viewer_next_button.set_margin_end(12)
+        image_area.add_overlay(self.gallery_viewer_next_button)
+        viewer.append(image_area)
+        self.gallery_viewer_status = Gtk.Label(label="", xalign=0)
+        self.gallery_viewer_status.add_css_class("dim-label")
+        viewer.append(self.gallery_viewer_status)
+        return viewer
 
     def _build_files_page(self):
         page = self._page()
@@ -2844,6 +2971,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if self.photo_preview_dir:
             self.photo_preview_dir.cleanup()
             self.photo_preview_dir = None
+        if self.gallery_viewer_tempdir:
+            self.gallery_viewer_tempdir.cleanup()
+            self.gallery_viewer_tempdir = None
         for cache in self.external_photo_dirs:
             cache.cleanup()
         self.external_photo_dirs.clear()
@@ -2888,6 +3018,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if not getattr(self, "droidlink_bridge", None):
             return GLib.SOURCE_REMOVE
         state = self.droidlink_bridge.snapshot()
+        self._update_droidlink_relay_panel(state)
         if state["paired"]:
             phone = state["phone"]
             name = " ".join(part for part in (phone.get("manufacturer"), phone.get("model")) if part)
@@ -2920,6 +3051,51 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.droidlink_empty.set_visible(not self.droidlink_messages)
         self._update_controls()
         return GLib.SOURCE_REMOVE
+
+    def _update_droidlink_relay_panel(self, state):
+        if not hasattr(self, "droidlink_relay_indicator"):
+            return
+        reachable = state.get("relay_reachable")
+        if reachable is True:
+            color, label = "#2ec27e", "Serveur joignable"
+        elif reachable is False:
+            color, label = "#e01b24", "Serveur inaccessible"
+        else:
+            color, label = "#9a9996", "Vérification du relais…"
+        self.droidlink_relay_indicator.set_markup(f'<span foreground="{color}">●</span>')
+        self.droidlink_relay_status.set_text(label)
+        self.droidlink_relay_url.set_text(state.get("relay_url") or "Relais HTTPS")
+
+        entries = tuple(
+            (entry.get("timestamp", 0), entry.get("route", ""), entry.get("detail", ""), entry.get("success"))
+            for entry in state.get("relay_log", [])
+        )
+        if entries == self._droidlink_log_snapshot:
+            return
+        self._droidlink_log_snapshot = entries
+        while child := self.droidlink_relay_log_box.get_first_child():
+            self.droidlink_relay_log_box.remove(child)
+        if not entries:
+            empty = Gtk.Label(label="Aucun échange enregistré.", xalign=0)
+            empty.add_css_class("dim-label")
+            self.droidlink_relay_log_box.append(empty)
+            return
+        for timestamp, route, detail, success in entries[:8]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            result_color = "#2ec27e" if success else "#e01b24"
+            result = Gtk.Label(label="●")
+            result.set_use_markup(True)
+            result.set_markup(f'<span foreground="{result_color}">●</span>')
+            when = Gtk.Label(label=time.strftime("%H:%M:%S", time.localtime(timestamp)))
+            when.add_css_class("dim-label")
+            message = Gtk.Label(label=f"{route} · {detail}", xalign=0)
+            message.set_hexpand(True)
+            message.set_ellipsize(Pango.EllipsizeMode.END)
+            message.set_max_width_chars(90)
+            row.append(result)
+            row.append(when)
+            row.append(message)
+            self.droidlink_relay_log_box.append(row)
 
     def _droidlink_received(self, event):
         if event.get("type") == "contacts_list":
@@ -3885,6 +4061,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.photos_open_button.set_sensitive(ready and photo_path_available)
         self.photos_download_button.set_sensitive(ready and photo_path_available)
         self.photos_external_button.set_sensitive(ready and photo_path_available)
+        self.gallery_viewer_delete_button.set_sensitive(ready and photo_path_available and not self.busy)
         self.droidlink_disconnect_button.set_sensitive(linked and not self.busy)
         phone_relay_ready = ready and state["paired"] and state["phone"].get("notificationAccess")
         self.ring_phone_button.set_sensitive(phone_relay_ready)
@@ -4586,15 +4763,20 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self._refresh_sms()
 
     def _update_sms_contact_labels(self):
-        if not self.sms_selected_number or not self.sms_messages:
+        if not self.sms_messages:
             return
-        conversation = next(
-            (item for item in self.sms_conversations if str(item["thread_id"]) == str(self.sms_selected_thread)),
-            None,
-        )
-        title = self._sms_conversation_label(conversation) if conversation else self._sms_display_name(self.sms_selected_number)
-        self.sms_thread_title.set_text(f"{title} · {len(self.sms_messages)} messages")
-        self.sms_recipient_label.set_text(f"Répondre au groupe · {title}" if self.sms_thread_is_group else f"Répondre à {title}")
+        if self.sms_selected_number:
+            conversation = next(
+                (item for item in self.sms_conversations if str(item["thread_id"]) == str(self.sms_selected_thread)),
+                None,
+            )
+            title = self._sms_conversation_label(conversation) if conversation else self._sms_display_name(self.sms_selected_number)
+            self.sms_thread_title.set_text(f"{title} · {len(self.sms_messages)} messages")
+            self.sms_recipient_label.set_text(f"Répondre au groupe · {title}" if self.sms_thread_is_group else f"Répondre à {title}")
+            self._update_sms_participants(conversation)
+            self.sms_body_view.set_sensitive(True)
+            self.sms_open_button.set_label("Ouvrir Messages")
+        self._render_sms_thread()
 
     def _filtered_contacts(self):
         query = self.contact_search.get_text().strip().casefold()
@@ -4935,6 +5117,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_number_entry.set_visible(True)
         self.sms_recipient_label.set_text("Nouveau message · destinataire")
         self.sms_thread_title.set_text("Nouveau message")
+        self.sms_participants_label.set_visible(False)
+        self.sms_body_view.set_sensitive(True)
+        self.sms_open_button.set_label("Ouvrir Messages")
         self.sms_messages = []
         self._render_sms_thread()
         self.stack.set_visible_child_name("sms")
@@ -5063,6 +5248,16 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                     "body": str(item.get("body", ""))[:6_000],
                     "subject": str(item.get("subject", ""))[:500],
                     "media": [str(value)[:180] for value in item.get("media", [])[:20]],
+                    "attachments": [
+                        {
+                            "part_id": str(value.get("part_id", ""))[:40],
+                            "content_type": str(value.get("content_type", ""))[:100],
+                            "name": str(value.get("name", ""))[:180],
+                            "path": str(value.get("path", ""))[:500],
+                        }
+                        for value in item.get("attachments", [])[:20]
+                        if isinstance(value, dict)
+                    ],
                     "sender": str(item.get("sender", ""))[:180],
                 })
             except (TypeError, ValueError):
@@ -5089,6 +5284,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                     "body": str(message.get("body", ""))[:6_000],
                     "subject": str(message.get("subject", ""))[:500],
                     "media": [str(value)[:180] for value in message.get("media", [])[:20]],
+                    "attachments": message.get("attachments", [])[:20],
                 }
                 for message in self.sms_messages[-100:]
             ],
@@ -5170,7 +5366,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 "thread_id": thread_id,
                 "recipient_ids": recipient_ids,
                 "recipients": recipients,
-                "is_group": len(recipient_ids) > 1,
+                "is_group": len(recipient_ids) > 1 or any(
+                    address.casefold().endswith("@rcs.google.com") for address in recipients
+                ),
                 "number": ";".join(recipients),
                 "date": date,
                 "preview": "" if item.get("snippet", "").casefold() == "null" else item.get("snippet", ""),
@@ -5195,6 +5393,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         number = str(number or "").strip()
         if not number or number.casefold() == "null":
             return "Numéro inconnu"
+        if number.casefold().endswith("@rcs.google.com"):
+            return "RCS · dans Google Messages"
         normalized = re.sub(r"\D", "", number)
         for name, contact_numbers in self.contacts:
             for contact_number in contact_numbers:
@@ -5220,6 +5420,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         recipients = self._sms_conversation_numbers(conversation)
         labels = [self._sms_display_name(number) for number in recipients]
         is_group = conversation.get("is_group", len(conversation.get("recipient_ids", [])) > 1)
+        if len(labels) == 1 and labels[0] == "RCS · dans Google Messages":
+            return labels[0]
         if not labels:
             return "Groupe SMS" if is_group else "Conversation"
         if len(labels) == 1 and not is_group:
@@ -5349,6 +5551,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_number_entry.set_visible(True)
         self.sms_recipient_label.set_text("Nouveau message · destinataire")
         self.sms_thread_title.set_text("Nouveau message")
+        self.sms_participants_label.set_visible(False)
+        self.sms_body_view.set_sensitive(True)
+        self.sms_open_button.set_label("Ouvrir Messages")
         self.sms_messages = []
         self._render_sms_thread()
         self.sms_number_entry.grab_focus()
@@ -5367,10 +5572,21 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.sms_selected_recipients = self._sms_conversation_numbers(conversation)
         self.sms_thread_is_group = conversation.get("is_group", len(self.sms_selected_recipients) > 1)
         self.sms_selected_number = ";".join(self.sms_selected_recipients)
+        if any(number.casefold().endswith("@rcs.google.com") for number in self.sms_selected_recipients):
+            self.sms_messages = []
+            self.sms_thread_title.set_text("RCS · contenu non exposé à DroidDesk")
+            self.sms_recipient_label.set_text(
+                "Google Messages conserve les messages, participants et médias RCS sur le téléphone."
+            )
+            self.sms_participants_label.set_visible(False)
+            self.sms_body_view.set_sensitive(False)
+            self.sms_open_button.set_label("Ouvrir Google Messages")
+            self._render_sms_thread()
+            return
         cached = self._read_sms_thread_cache(thread_id)
         if cached:
             self.sms_selected_recipients = cached.get("recipients") or self.sms_selected_recipients
-            self.sms_thread_is_group = bool(cached.get("is_group", self.sms_thread_is_group))
+            self.sms_thread_is_group = self.sms_thread_is_group or bool(cached.get("is_group", False))
             self._show_sms_thread_messages(cached.get("messages", []), from_cache=True)
         else:
             self.sms_thread_title.set_text("Chargement de la conversation…")
@@ -5385,6 +5601,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         )
 
     def _show_sms_thread_messages(self, messages, from_cache=False):
+        self.sms_body_view.set_sensitive(True)
+        self.sms_open_button.set_label("Ouvrir Messages")
         self.sms_messages = list(messages)
         discovered_recipients = []
         for message in self.sms_messages:
@@ -5412,11 +5630,28 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.sms_recipient_label.set_text(
                 f"Répondre au groupe · {title}" if self.sms_thread_is_group else f"Répondre à {title}"
             )
+            self._update_sms_participants(conversation)
         else:
             self.sms_selected_number = ""
             self.sms_thread_title.set_text("Conversation vide")
             self.sms_recipient_label.set_text("Conversation vide")
+            self.sms_participants_label.set_visible(False)
         self._render_sms_thread()
+
+    def _update_sms_participants(self, conversation=None):
+        if not hasattr(self, "sms_participants_label"):
+            return
+        conversation = conversation or next(
+            (item for item in self.sms_conversations if str(item["thread_id"]) == str(self.sms_selected_thread)),
+            {},
+        )
+        recipients = self._sms_conversation_numbers(conversation) if conversation else self.sms_selected_recipients
+        labels = list(dict.fromkeys(self._sms_display_name(number) for number in recipients))
+        if self.sms_thread_is_group and labels:
+            self.sms_participants_label.set_text("Participants · " + " · ".join(labels))
+            self.sms_participants_label.set_visible(True)
+        else:
+            self.sms_participants_label.set_visible(False)
 
     def _sms_thread_result(self, result, error):
         if error or not result or result.returncode != 0:
@@ -5441,6 +5676,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                     "body": item.get("body", ""),
                     "subject": item.get("subject", "").strip(),
                     "media": [],
+                    "attachments": [],
                     "sender": "",
                 }
             except ValueError:
@@ -5487,7 +5723,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             return
         where = f"mid IN ({','.join(mms_ids)})"
         self._run_adb_command(
-            _content_query_args("content://mms/part", "mid:ct:name:text", where=where),
+            _content_query_args("content://mms/part", "_id:mid:ct:name:text", where=where),
             "Lecture du texte et des médias MMS…",
             self._sms_mms_parts_result,
             timeout=90,
@@ -5507,6 +5743,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             )
             return
         messages = {message["id"]: message for message in self.sms_messages}
+        downloadable = []
         for item in _sms_rows(result.stdout):
             message = messages.get(item.get("mid", "").strip())
             if not message:
@@ -5514,21 +5751,90 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             content_type = item.get("ct", "").strip().casefold()
             name = item.get("name", "").strip()
             part_text = item.get("text", "").strip()
+            part_id = item.get("_id", "").strip()
             if content_type.startswith("text/") and part_text and part_text.casefold() != "null":
                 message["body"] = "\n".join(filter(None, (message["body"], part_text)))
-            elif content_type.startswith("image/"):
-                message["media"].append(f"Image jointe{f' · {name}' if name and name.casefold() != 'null' else ''}")
-            elif content_type.startswith("video/"):
-                message["media"].append(f"Vidéo jointe{f' · {name}' if name and name.casefold() != 'null' else ''}")
-            elif content_type.startswith("audio/"):
-                message["media"].append(f"Audio joint{f' · {name}' if name and name.casefold() != 'null' else ''}")
-            elif name and name.casefold() != "null":
-                message["media"].append(f"Fichier joint · {name}")
+            elif content_type and part_id.isdigit():
+                attachment = {
+                    "part_id": part_id,
+                    "content_type": content_type[:100],
+                    "name": name[:180] if name and name.casefold() != "null" else "",
+                    "path": "",
+                }
+                message["attachments"].append(attachment)
+                downloadable.append((message["id"], attachment))
+                label = "Image jointe" if content_type.startswith("image/") else (
+                    "Vidéo jointe" if content_type.startswith("video/") else (
+                        "Audio joint" if content_type.startswith("audio/") else "Fichier joint"
+                    )
+                )
+                suffix = f" · {attachment['name']}" if attachment["name"] else ""
+                message["media"].append(f"{label}{suffix}")
         for message in self.sms_messages:
             if message["transport"] == "mms" and not message["body"] and not message["subject"] and not message["media"]:
                 message["media"].append("MMS · média sans texte")
         self._render_sms_thread()
         self._save_sms_thread_cache(self.sms_selected_thread)
+        active = self._active_device()
+        if active and downloadable:
+            self._download_mms_attachments(str(self.sms_selected_thread), active[0], downloadable)
+
+    def _sms_attachment_cache_path(self, thread_id, message_id, attachment):
+        directory = self._sms_cache_directory()
+        part_id = str(attachment.get("part_id", ""))
+        if not directory or not all(str(value).isdigit() for value in (thread_id, message_id, part_id)):
+            return None
+        extension = mimetypes.guess_extension(attachment.get("content_type", "")) or ".bin"
+        return directory / "attachments" / f"{thread_id}-{message_id}-{part_id}{extension}"
+
+    def _download_mms_attachments(self, thread_id, serial, attachments):
+        tasks = []
+        for message_id, attachment in attachments:
+            path = self._sms_attachment_cache_path(thread_id, message_id, attachment)
+            if path:
+                tasks.append((message_id, dict(attachment), path))
+        if not tasks:
+            return
+
+        def worker():
+            completed = []
+            for message_id, attachment, path in tasks:
+                if path.is_file():
+                    completed.append((message_id, attachment["part_id"], str(path)))
+                    continue
+                try:
+                    result = subprocess.run(
+                        [
+                            self.adb, "-s", serial, "exec-out", "content", "read", "--uri",
+                            f"content://mms/part/{attachment['part_id']}",
+                        ],
+                        capture_output=True,
+                        timeout=45,
+                        check=False,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                if result.returncode == 0 and result.stdout and len(result.stdout) <= 12 * 1024 * 1024:
+                    self._write_private_cache_bytes(path, result.stdout)
+                    if path.is_file():
+                        completed.append((message_id, attachment["part_id"], str(path)))
+            GLib.idle_add(self._sms_mms_attachments_ready, thread_id, serial, completed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _sms_mms_attachments_ready(self, thread_id, serial, completed):
+        active = self._active_device()
+        if str(self.sms_selected_thread) != str(thread_id) or not active or active[0] != serial:
+            return GLib.SOURCE_REMOVE
+        paths = {(message_id, part_id): path for message_id, part_id, path in completed}
+        for message in self.sms_messages:
+            for attachment in message.get("attachments", []):
+                path = paths.get((message.get("id", ""), attachment.get("part_id", "")))
+                if path:
+                    attachment["path"] = path
+        self._render_sms_thread()
+        self._save_sms_thread_cache(self.sms_selected_thread)
+        return GLib.SOURCE_REMOVE
 
     def _render_sms_thread(self):
         while child := self.sms_thread_list.get_first_child():
@@ -5544,8 +5850,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             bubble.set_margin_top(2)
             bubble.set_margin_bottom(2)
             bubble.add_css_class("sms-bubble-incoming" if incoming else "sms-bubble-outgoing")
-            if self.sms_thread_is_group and incoming and message.get("sender"):
-                sender = Gtk.Label(label=self._sms_display_name(message["sender"]), xalign=0)
+            sender_address = message.get("sender", "") or (message.get("address", "") if incoming else "")
+            if incoming and sender_address:
+                sender = Gtk.Label(label=self._sms_display_name(sender_address), xalign=0)
                 sender.add_css_class("caption")
                 sender.add_css_class("accent")
                 bubble.append(sender)
@@ -5561,6 +5868,25 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             text.set_max_width_chars(52)
             text.set_selectable(True)
             bubble.append(text)
+            for attachment in message.get("attachments", []):
+                path = attachment.get("path", "")
+                content_type = attachment.get("content_type", "")
+                if not path or not Path(path).is_file():
+                    continue
+                if content_type.startswith("image/"):
+                    picture = Gtk.Picture.new_for_filename(path)
+                    picture.set_can_shrink(True)
+                    picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                    picture.set_size_request(220, 160)
+                    picture.set_tooltip_text(attachment.get("name") or "Pièce jointe")
+                    bubble.append(picture)
+                else:
+                    label = attachment.get("name") or (
+                        "Vidéo" if content_type.startswith("video/") else "Pièce jointe"
+                    )
+                    open_button = Gtk.Button(label=f"Ouvrir · {label}")
+                    open_button.connect("clicked", self._open_sms_attachment, path)
+                    bubble.append(open_button)
             try:
                 when = datetime.fromtimestamp(message["date"] / 1000).strftime("%d %b · %H:%M")
             except (ValueError, OSError, OverflowError):
@@ -5572,17 +5898,35 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             line.append(bubble)
             self.sms_thread_list.append(line)
         if self.sms_messages:
-            GLib.idle_add(self._scroll_sms_thread_to_bottom)
+            # GTK may not have measured the newly appended bubbles when the
+            # idle callback runs. Recheck briefly after layout so long threads
+            # reliably open on their newest message (including cached renders).
+            GLib.timeout_add(40, self._scroll_sms_thread_to_bottom, 0)
 
-    def _scroll_sms_thread_to_bottom(self):
+    def _open_sms_attachment(self, _button, path):
+        try:
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
+        except GLib.Error as error:
+            self._set_status(f"Impossible d’ouvrir la pièce jointe : {error.message}", True)
+
+    def _scroll_sms_thread_to_bottom(self, attempt=0):
         adjustment = self.sms_thread_scroll.get_vadjustment() if hasattr(self, "sms_thread_scroll") else None
         if adjustment:
-            adjustment.set_value(adjustment.get_upper())
+            bottom = max(
+                adjustment.get_lower(),
+                adjustment.get_upper() - adjustment.get_page_size(),
+            )
+            adjustment.set_value(bottom)
+            if attempt < 5:
+                GLib.timeout_add(40, self._scroll_sms_thread_to_bottom, attempt + 1)
         return GLib.SOURCE_REMOVE
 
     def _send_sms_to_phone(self, *_args):
         active = self._active_device()
         if not active:
+            return
+        if any(number.casefold().endswith("@rcs.google.com") for number in self.sms_selected_recipients):
+            self._open_google_messages_in_droiddesk()
             return
         raw = self.sms_number_entry.get_text().strip()
         recipients = [item.strip() for item in re.split(r"[;,]", raw) if item.strip()]
@@ -5623,6 +5967,27 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if active:
             self._launch_scrcpy(active[0])
         self._set_status("Message préparé dans l’application Android. Vérifie-le et touche Envoyer sur le téléphone.")
+
+    def _open_google_messages_in_droiddesk(self, *_args):
+        active = self._active_device()
+        if not active:
+            self._set_status("Connecte le téléphone pour afficher Google Messages dans DroidDesk.", True)
+            return
+        serial = active[0]
+        self._run_adb_command(
+            ["shell", "monkey", "-p", "com.google.android.apps.messaging", "1"],
+            "Ouverture de Google Messages dans l’écran DroidDesk…",
+            lambda result, error: self._google_messages_opened_in_droiddesk(serial, result, error),
+            timeout=20,
+        )
+
+    def _google_messages_opened_in_droiddesk(self, serial, result, error):
+        if error or not result or result.returncode != 0:
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self._set_status(f"Impossible d’ouvrir Google Messages : {detail}", True)
+            return
+        self.stack.set_visible_child_name("screen")
+        self._launch_scrcpy(serial, "Google Messages · RCS")
 
     def _run_adb_command(self, args, message, callback, needs_device=True, timeout=25):
         if self.busy:
@@ -5762,6 +6127,40 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             return bool(value.get("record_calls", False))
         except (OSError, ValueError, AttributeError):
             return False
+
+    def _load_navigation_pane_width(self):
+        path = Path(GLib.get_user_config_dir()) / "droiddesk" / "settings.json"
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+            return max(210, min(560, int(settings.get("navigation_width", 280))))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 280
+
+    def _navigation_pane_position_changed(self, _paned, _param):
+        if self.navigation_position_save_source:
+            GLib.source_remove(self.navigation_position_save_source)
+        self.navigation_position_save_source = GLib.timeout_add(
+            350, self._save_navigation_pane_width
+        )
+
+    def _save_navigation_pane_width(self):
+        self.navigation_position_save_source = 0
+        path = Path(GLib.get_user_config_dir()) / "droiddesk" / "settings.json"
+        try:
+            try:
+                settings = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                settings = {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["navigation_width"] = int(self.navigation_paned.get_position())
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            pass
+        return GLib.SOURCE_REMOVE
 
     def _save_call_recording_enabled(self, enabled):
         path = Path(GLib.get_user_config_dir()) / "droiddesk" / "settings.json"
@@ -6780,6 +7179,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _on_window_close_request(self, *_args):
         self._stop_embedded_stream()
+        if not getattr(self.get_application(), "_quitting", False):
+            self.hide()
+            return True
         return False
 
     def _read_embedded_frames(self, generation, decoder):
@@ -7613,7 +8015,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 self.gallery_preview_cache_paths[photo_id] = cache_path.with_name(f"{cache_path.stem}-preview.jpg")
             card = Gtk.Button()
             card.add_css_class("card")
-            card.set_size_request(320, -1)
+            card.set_size_request(204, -1)
             card.set_hexpand(True)
             content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             content.set_hexpand(True)
@@ -7625,7 +8027,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             thumbnail.set_can_shrink(True)
             thumbnail.set_content_fit(Gtk.ContentFit.COVER)
             thumbnail.add_css_class("gallery-thumbnail")
-            thumbnail.set_size_request(300, 260)
+            thumbnail.set_size_request(192, 150)
             thumbnail.set_hexpand(True)
             thumbnail.set_halign(Gtk.Align.FILL)
             placeholder = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
@@ -7634,7 +8036,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             placeholder.set_halign(Gtk.Align.CENTER)
             placeholder.set_valign(Gtk.Align.CENTER)
             thumbnail_frame = Gtk.Overlay()
-            thumbnail_frame.set_size_request(300, 260)
+            thumbnail_frame.set_size_request(192, 150)
             thumbnail_frame.set_hexpand(True)
             thumbnail_frame.set_child(thumbnail)
             thumbnail_frame.add_overlay(placeholder)
@@ -7645,7 +8047,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             name.add_css_class("caption")
             content.append(name)
             card.set_child(content)
-            card.connect("clicked", lambda _button, record=photo: self._select_gallery_photo(record))
+            card.connect("clicked", lambda _button, record=photo: self._open_gallery_photo(record))
             self.photos_flow.append(card)
             self.gallery_cards[photo_id] = {
                 "button": card,
@@ -7688,6 +8090,177 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if current:
             current["button"].add_css_class("suggested-action")
         self._update_controls()
+
+    def _open_gallery_photo(self, photo):
+        photo_id = int(photo.get("id", 0) or 0)
+        self.gallery_viewer_index = next(
+            (index for index, item in enumerate(self.gallery_photos) if int(item.get("id", 0) or 0) == photo_id),
+            -1,
+        )
+        if self.gallery_viewer_index < 0:
+            return
+        self._select_gallery_photo(photo)
+        self.gallery_view_stack.set_visible_child_name("viewer")
+        self._load_gallery_viewer_image()
+
+    def _load_gallery_viewer_image(self):
+        if not (0 <= self.gallery_viewer_index < len(self.gallery_photos)):
+            return
+        photo = self.gallery_photos[self.gallery_viewer_index]
+        photo_id = int(photo.get("id", 0) or 0)
+        name = photo.get("name") or f"Photo {photo_id}"
+        self.gallery_viewer_title.set_text(name)
+        self.gallery_viewer_status.set_text(
+            f"{self.gallery_viewer_index + 1} / {len(self.gallery_photos)} · Chargement de l’original…"
+        )
+        card = self.gallery_cards.get(photo_id)
+        paintable = card["image"].get_paintable() if card else None
+        self.gallery_viewer_picture.set_paintable(paintable)
+        self.gallery_viewer_previous_button.set_sensitive(self.gallery_viewer_index > 0)
+        self.gallery_viewer_next_button.set_sensitive(self.gallery_viewer_index + 1 < len(self.gallery_photos))
+        active = self._active_device()
+        remote_path = self._safe_media_path(photo.get("path", ""))
+        if not active or not remote_path:
+            self.gallery_viewer_status.set_text("Photo inaccessible ou téléphone déconnecté.")
+            return
+
+        self.gallery_viewer_generation += 1
+        generation = self.gallery_viewer_generation
+        if self.gallery_viewer_tempdir:
+            self.gallery_viewer_tempdir.cleanup()
+        tempdir = tempfile.TemporaryDirectory(prefix="droiddesk-gallery-view-")
+        self.gallery_viewer_tempdir = tempdir
+        local_path = Path(tempdir.name) / Path(photo.get("name") or f"photo-{photo_id}.jpg").name
+        serial = active[0]
+
+        def worker():
+            try:
+                result = subprocess.run(
+                    [self.adb, "-s", serial, "pull", remote_path, str(local_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    check=False,
+                )
+                error = None
+            except (OSError, subprocess.SubprocessError) as exc:
+                result = None
+                error = str(exc)
+            GLib.idle_add(
+                self._gallery_viewer_image_ready,
+                generation,
+                tempdir,
+                local_path,
+                result,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _gallery_viewer_image_ready(self, generation, tempdir, local_path, result, error):
+        if generation != self.gallery_viewer_generation or self.gallery_view_stack.get_visible_child_name() != "viewer":
+            if tempdir is not self.gallery_viewer_tempdir:
+                tempdir.cleanup()
+            return GLib.SOURCE_REMOVE
+        if error or not result or result.returncode != 0 or not local_path.is_file():
+            detail = error or ((result.stderr or result.stdout).strip() if result else "")
+            self.gallery_viewer_status.set_text(f"Impossible de charger cette photo : {detail[:180]}")
+            self._set_status("Impossible de charger la photo originale.", True)
+            return GLib.SOURCE_REMOVE
+        self.gallery_viewer_picture.set_file(Gio.File.new_for_path(str(local_path)))
+        self.gallery_viewer_status.set_text(
+            f"{self.gallery_viewer_index + 1} / {len(self.gallery_photos)} · {local_path.name}"
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _gallery_viewer_previous(self, *_args):
+        if self.gallery_viewer_index > 0:
+            self.gallery_viewer_index -= 1
+            self._select_gallery_photo(self.gallery_photos[self.gallery_viewer_index])
+            self._load_gallery_viewer_image()
+
+    def _gallery_viewer_next(self, *_args):
+        if self.gallery_viewer_index + 1 < len(self.gallery_photos):
+            self.gallery_viewer_index += 1
+            self._select_gallery_photo(self.gallery_photos[self.gallery_viewer_index])
+            self._load_gallery_viewer_image()
+
+    def _close_gallery_viewer(self, *_args):
+        self.gallery_viewer_generation += 1
+        self.gallery_viewer_picture.set_paintable(None)
+        if self.gallery_viewer_tempdir:
+            self.gallery_viewer_tempdir.cleanup()
+            self.gallery_viewer_tempdir = None
+        self.gallery_view_stack.set_visible_child_name("browser")
+
+    def _confirm_gallery_photo_delete(self, *_args):
+        photo = self._selected_gallery_photo()
+        if not photo:
+            return
+        name = photo.get("name") or "cette photo"
+        dialog = Gtk.Dialog(title="Supprimer cette photo ?", transient_for=self, modal=True)
+        content = dialog.get_content_area()
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+        label = Gtk.Label(
+            label=f"{name} sera supprimée du téléphone. Cette action ne peut pas être annulée.",
+            xalign=0,
+        )
+        label.set_wrap(True)
+        content.append(label)
+        dialog.add_button("Annuler", Gtk.ResponseType.CANCEL)
+        delete_button = dialog.add_button("Supprimer", Gtk.ResponseType.ACCEPT)
+        delete_button.add_css_class("destructive-action")
+        dialog.connect("response", lambda current, answer: self._gallery_photo_delete_confirmed(current, answer, photo))
+        dialog.present()
+
+    def _gallery_photo_delete_confirmed(self, dialog, answer, photo):
+        dialog.destroy()
+        if answer != Gtk.ResponseType.ACCEPT:
+            return
+        photo_id = str(photo.get("id", ""))
+        if not photo_id.isdigit():
+            self._set_status("Identifiant de photo Android invalide.", True)
+            return
+        self._run_adb_command(
+            ["shell", "content", "delete", "--uri", f"content://media/external/images/media/{photo_id}"],
+            "Suppression de la photo sur le téléphone…",
+            lambda result, error: self._gallery_photo_delete_result(photo, result, error),
+            timeout=45,
+        )
+
+    def _gallery_photo_delete_result(self, photo, result, error):
+        output = (result.stdout or "").strip() if result else ""
+        if error or not result or result.returncode != 0 or not re.search(r"Deleted\s+1\s+rows?", output, re.IGNORECASE):
+            detail = error or ((result.stderr or output).strip() if result else "")
+            self._set_status(f"Suppression impossible : {detail[:220] or output or 'Android n’a confirmé aucune suppression.'}", True)
+            return
+        photo_id = int(photo.get("id", 0) or 0)
+        next_index = max(0, self.gallery_viewer_index)
+        for cache_map in (self.gallery_thumbnail_cache_paths, self.gallery_preview_cache_paths):
+            path = cache_map.pop(photo_id, None)
+            if path:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        remaining = [item for item in self.gallery_photos if int(item.get("id", 0) or 0) != photo_id]
+        self.gallery_photos = remaining
+        self.gallery_cards.pop(photo_id, None)
+        self.gallery_viewer_generation += 1
+        if self.gallery_viewer_tempdir:
+            self.gallery_viewer_tempdir.cleanup()
+            self.gallery_viewer_tempdir = None
+        self._populate_photos_gallery(remaining, from_cache=True)
+        self._save_gallery_metadata_cache()
+        if remaining:
+            self._open_gallery_photo(remaining[min(next_index, len(remaining) - 1)])
+        else:
+            self._close_gallery_viewer()
+            self.photos_status.set_text("Aucune photo accessible.")
+        self._set_status(f"{photo.get('name') or 'Photo'} supprimée du téléphone.")
 
     def _gallery_scroll_changed(self, adjustment):
         count = len(self.gallery_photos)
@@ -7828,6 +8401,15 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _set_gallery_thumbnail(card, pixbuf):
+        # Bound decoded preview images to the miniature size used in the grid.
+        # This keeps 900 px previews from occupying full-size textures per card.
+        scale = min(384 / pixbuf.get_width(), 300 / pixbuf.get_height(), 1.0)
+        if scale < 1.0:
+            pixbuf = pixbuf.scale_simple(
+                max(1, round(pixbuf.get_width() * scale)),
+                max(1, round(pixbuf.get_height() * scale)),
+                GdkPixbuf.InterpType.BILINEAR,
+            )
         card["image"].set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
         card["placeholder"].set_visible(False)
 
@@ -7922,7 +8504,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _open_selected_gallery_photo(self, *_args):
         photo = self._selected_gallery_photo()
         if photo:
-            self._preview_remote_image(self._safe_media_path(photo["path"]))
+            self._open_gallery_photo(photo)
 
     def _download_selected_gallery_photo(self, *_args):
         photo = self._selected_gallery_photo()
@@ -8159,12 +8741,21 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 class DroidDeskApplication(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self._quitting = False
+        self._tray_hold_active = False
+        self._tray_process = None
         self._notification_bus = None
         self._notification_signal_ids = []
         self._android_notification_ids = {}
         self._android_notification_keys = {}
         self._notification_action_ids = set()
         self.connect("activate", self._activate)
+        show_action = Gio.SimpleAction.new("show", None)
+        show_action.connect("activate", self._activate)
+        self.add_action(show_action)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self._quit_from_tray)
+        self.add_action(quit_action)
         open_notification = Gio.SimpleAction.new(
             "open-android-notification", GLib.VariantType.new("s")
         )
@@ -8432,9 +9023,47 @@ class DroidDeskApplication(Adw.Application):
 
     def _activate(self, _application):
         self._ensure_notification_bus()
+        if not self._tray_hold_active:
+            self.hold()
+            self._tray_hold_active = True
+        self._start_tray_process()
         if not hasattr(self, "window"):
             self.window = DroidDeskWindow(self)
         self.window.present()
+
+    def _start_tray_process(self):
+        if self._tray_process and self._tray_process.poll() is None:
+            return
+        tray_executable = str(Path(sys.argv[0]).resolve().with_name("droiddesk-tray"))
+        if not os.path.isfile(tray_executable):
+            tray_executable = shutil.which("droiddesk-tray")
+        if not tray_executable:
+            return
+        try:
+            self._tray_process = subprocess.Popen(
+                [tray_executable],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            self._tray_process = None
+
+    def _quit_from_tray(self, *_args):
+        if self._quitting:
+            return
+        self._quitting = True
+        if hasattr(self, "window"):
+            self.window.close()
+        tray_process = self._tray_process
+        self._tray_process = None
+        if tray_process and tray_process.poll() is None:
+            tray_process.terminate()
+        if self._tray_hold_active:
+            self.release()
+            self._tray_hold_active = False
+        self.quit()
 
 
 def main():

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.example.DroidDesk</id>
-  <icon type="stock">io.github.example.DroidDesk</icon>
+  <icon type="stock">droiddesk</icon>
   <name>DroidDesk</name>
   <summary>Android, ADB, Bluetooth et scrcpy dans GNOME</summary>
   <metadata_license>CC0-1.0</metadata_license>
@@ -17,6 +17,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-11-25">
+      <description>
+        <p>Ajoute un relais DroidLink auto-hébergé, des diagnostics de connexion et une tuile Android pour ouvrir DroidLink depuis le panneau rapide. ADB découvre les téléphones déjà appairés en Wi-Fi par mDNS. Améliore la lecture et la mise en cache des conversations et médias.</p>
+        <p>La galerie ouvre les photos dans DroidDesk, avec navigation et suppression confirmée. Le lanceur affiche quatre applications par rangée et la galerie trois photos. Le panneau principal est redimensionnable et les conversations défilent sur le message le plus récent.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-24">
       <description><p>Première version publique de DroidDesk : appels, contacts et journal, SMS, applications Android, écran scrcpy intégré, photos, fichiers, Bluetooth, ADB et notifications GNOME via DroidLink.</p></description>
     </release>

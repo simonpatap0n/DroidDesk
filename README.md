@@ -2,9 +2,9 @@
 
 DroidDesk est une application GTK4/libadwaita pour gérer un téléphone Android depuis GNOME avec ADB, scrcpy et BlueZ.
 
-## Télécharger DroidDesk 0.1.0
+## Télécharger DroidDesk 0.1.1
 
-La première version publique est disponible dans les [releases GitHub](https://github.com/simonpatap0n/DroidDesk/releases/tag/v0.1.0), avec l’APK compagnon [DroidLink-0.1.0.apk](https://github.com/simonpatap0n/DroidDesk/releases/download/v0.1.0/DroidLink-0.1.0.apk).
+La version 0.1.1 est disponible dans les [releases GitHub](https://github.com/simonpatap0n/DroidDesk/releases/tag/v0.1.1), avec l’APK compagnon [DroidLink-0.1.1.apk](https://github.com/simonpatap0n/DroidDesk/releases/download/v0.1.1/DroidLink-0.1.1.apk).
 
 ## Fonctionnalités
 
@@ -44,7 +44,7 @@ sudo systemctl enable --now bluetooth
 
 ### ADB sans fil
 
-Sur Android 11 ou plus récent, ouvre **Options pour les développeurs → Débogage sans fil**. Dans la page **ADB** de DroidDesk, utilise **Appairer avec un code…**, puis **Connecter à une adresse…** avec l’adresse IP et le port de connexion affichés sur Android.
+Sur Android 11 ou plus récent, active **Options pour les développeurs → Débogage sans fil** et connecte le téléphone au même Wi-Fi que l’ordinateur. Dans la page **ADB** de DroidDesk, appaire-le une seule fois avec **Appairer avec un code…**; l’adresse et le port de l’écran « Associer un appareil » ne servent qu’à cet appairage. Ensuite, DroidDesk découvre le port de connexion changeant avec mDNS : clique **Connecter** dans la liste des appareils appairés, ou **Reconnecter** en haut pour lancer la reconnexion automatiquement. mDNS ne traverse pas le réseau mobile ni les réseaux Wi-Fi isolés.
 
 ## Lancer depuis les sources
 

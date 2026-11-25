@@ -37,6 +37,11 @@ class DroidLinkBridge:
         self.registered = False
         self.relay_error = ""
         self.relay_url = RELAY_URL
+        self.relay_reachable = None
+        self.relay_log = []
+        self._last_relay_log_key = None
+        self._last_relay_log_time = 0.0
+        self._last_health_probe = 0.0
         self.phone = {}
         self.commands = []
         self.pair_attempts = 0
@@ -224,6 +229,9 @@ class DroidLinkBridge:
                 "registered": self.registered,
                 "online": self.paired and self.phone_online and not self.relay_error,
                 "relay_error": self.relay_error,
+                "relay_url": self.relay_url,
+                "relay_reachable": self.relay_reachable,
+                "relay_log": list(self.relay_log),
                 "cache_id": cache_id,
                 "phone": dict(self.phone),
             }
@@ -274,15 +282,47 @@ class DroidLinkBridge:
             with urlopen(request, timeout=timeout) as response:
                 raw = response.read(MAX_BODY + 1)
                 if len(raw) > MAX_BODY:
-                    return response.status, {"error": "Réponse du relais trop volumineuse."}
-                return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+                    result = response.status, {"error": "Réponse du relais trop volumineuse."}
+                else:
+                    result = response.status, json.loads(raw.decode("utf-8")) if raw else {}
+                self._record_relay_result(method, path, result[0], result[1])
+                return result
         except HTTPError as error:
             try:
-                return error.code, json.loads(error.read(MAX_BODY).decode("utf-8"))
+                payload = json.loads(error.read(MAX_BODY).decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                return error.code, {"error": "Le relais a refusé la requête."}
+                payload = {"error": "Le relais a refusé la requête."}
+            self._record_relay_result(method, path, error.code, payload)
+            return error.code, payload
         except (OSError, URLError, TimeoutError, json.JSONDecodeError) as error:
-            return 0, {"error": str(error)[:240] or "Relais inaccessible."}
+            detail = str(error)[:240] or "Relais inaccessible."
+            self._record_relay_result(method, path, 0, {"error": detail})
+            return 0, {"error": detail}
+
+    def _record_relay_result(self, method, path, status, response):
+        route = re.sub(r"/v1/sessions/[A-Za-z0-9_-]{20,64}", "/v1/sessions/{id}", path.split("?", 1)[0])
+        reachable = 200 <= status < 500
+        detail = f"HTTP {status}" if status else str(response.get("error") or "Connexion impossible")[:180]
+        now = time.time()
+        key = (method, route, detail)
+        changed = False
+        with self.lock:
+            if self.relay_reachable != reachable:
+                self.relay_reachable = reachable
+                changed = True
+            if key != self._last_relay_log_key or now - self._last_relay_log_time >= 15:
+                self.relay_log.insert(0, {
+                    "timestamp": now,
+                    "route": f"{method} {route}",
+                    "detail": detail,
+                    "success": 200 <= status < 300,
+                })
+                del self.relay_log[20:]
+                self._last_relay_log_key = key
+                self._last_relay_log_time = now
+                changed = True
+        if changed:
+            self._changed()
 
     def _relay_loop(self):
         while not self.stop_event.is_set():
@@ -292,6 +332,10 @@ class DroidLinkBridge:
                 registered = self.registered
                 relay_url = self.relay_url
             if not session_id or not token:
+                now = time.monotonic()
+                if now - self._last_health_probe >= 15:
+                    self._last_health_probe = now
+                    self._relay_request("GET", "/healthz", timeout=4)
                 self.relay_wakeup.wait(1)
                 self.relay_wakeup.clear()
                 continue
