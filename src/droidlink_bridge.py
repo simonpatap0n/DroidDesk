@@ -11,14 +11,44 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
 PORT = 17891
 PAIRING_LIFETIME = 120
 MAX_BODY = 1_048_576
-RELAY_URL = "https://droidlink.patapon.lol"
 SESSION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "droiddesk" / "droidlink-session.json"
+RELAY_CONFIG_FILE = SESSION_FILE.with_name("droidlink-config.json")
+
+
+def _normalize_relay_url(value):
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("Entre le nom de domaine HTTPS du relais.")
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Le relais doit utiliser un nom d’hôte HTTPS valide.")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("Entre uniquement le domaine du relais, sans chemin ni paramètres.")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Le port du relais est invalide.") from error
+    hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    if ":" in hostname:
+        host = f"[{hostname}]"
+    else:
+        host = hostname.rstrip(".")
+        labels = host.split(".")
+        if len(labels) < 2 or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in labels
+        ):
+            raise ValueError("Utilise un nom de domaine complet, par exemple relay.example.net.")
+    return f"https://{host}{f':{port}' if port else ''}"
 
 
 class DroidLinkBridge:
@@ -36,7 +66,7 @@ class DroidLinkBridge:
         self.phone_online = False
         self.registered = False
         self.relay_error = ""
-        self.relay_url = RELAY_URL
+        self.relay_url = self._load_relay_url()
         self.relay_reachable = None
         self.relay_log = []
         self._last_relay_log_key = None
@@ -108,7 +138,9 @@ class DroidLinkBridge:
             if isinstance(pending_code, str) and re.fullmatch(r"\d{6}", pending_code) and remaining > 0:
                 self.code = pending_code
                 self.code_expires = time.monotonic() + min(PAIRING_LIFETIME, remaining)
-            self.relay_url = str(saved.get("relay_url") or RELAY_URL).rstrip("/")
+            saved_relay_url = saved.get("relay_url")
+            if isinstance(saved_relay_url, str) and saved_relay_url.strip():
+                self.relay_url = _normalize_relay_url(saved_relay_url)
             self.phone = {
                 "manufacturer": str(phone.get("manufacturer", ""))[:80],
                 "model": str(phone.get("model", ""))[:100],
@@ -118,6 +150,41 @@ class DroidLinkBridge:
             }
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return
+
+    @staticmethod
+    def _load_relay_url():
+        try:
+            config = json.loads(RELAY_CONFIG_FILE.read_text(encoding="utf-8"))
+            return _normalize_relay_url(config.get("relay_url", "")) if isinstance(config, dict) else ""
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return ""
+
+    def configure_relay_url(self, value):
+        try:
+            relay_url = _normalize_relay_url(value)
+        except ValueError as error:
+            return False, str(error)
+        with self.lock:
+            unchanged = self.relay_url == relay_url
+            if not unchanged and self.session_id and self.token:
+                return False, "Dissocie DroidLink avant de changer de domaine."
+            try:
+                RELAY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(RELAY_CONFIG_FILE.parent, 0o700)
+                temporary = RELAY_CONFIG_FILE.with_suffix(".tmp")
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump({"relay_url": relay_url}, stream, ensure_ascii=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, RELAY_CONFIG_FILE)
+            except OSError as error:
+                return False, f"Impossible d’enregistrer la configuration : {error}"
+            self.relay_url = relay_url
+            self.relay_error = ""
+        self.relay_wakeup.set()
+        self._changed()
+        return True, "Domaine du relais déjà configuré." if unchanged else "Domaine du relais enregistré."
 
     def _save_session_locked(self):
         if not self.token:
@@ -154,6 +221,15 @@ class DroidLinkBridge:
                     pass
 
     def begin_pairing(self):
+        with self.lock:
+            if not self.relay_url:
+                self.relay_error = "Configure le domaine HTTPS du relais avant l’association."
+                code = None
+            else:
+                code = True
+        if code is None:
+            self._changed()
+            return None
         previous = None
         with self.lock:
             if self.session_id and self.token:
@@ -167,7 +243,6 @@ class DroidLinkBridge:
             self.phone_online = False
             self.registered = False
             self.relay_error = ""
-            self.relay_url = RELAY_URL
             self.phone = {}
             self.commands.clear()
             self._save_session_locked()
@@ -294,7 +369,7 @@ class DroidLinkBridge:
                 payload = {"error": "Le relais a refusé la requête."}
             self._record_relay_result(method, path, error.code, payload)
             return error.code, payload
-        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
             detail = str(error)[:240] or "Relais inaccessible."
             self._record_relay_result(method, path, 0, {"error": detail})
             return 0, {"error": detail}
@@ -333,10 +408,17 @@ class DroidLinkBridge:
                 relay_url = self.relay_url
             if not session_id or not token:
                 now = time.monotonic()
-                if now - self._last_health_probe >= 15:
+                if relay_url and now - self._last_health_probe >= 15:
                     self._last_health_probe = now
                     self._relay_request("GET", "/healthz", timeout=4)
                 self.relay_wakeup.wait(1)
+                self.relay_wakeup.clear()
+                continue
+            if not relay_url:
+                with self.lock:
+                    self.relay_error = "Configure le domaine HTTPS du relais avant l’association."
+                self._changed()
+                self.relay_wakeup.wait(3)
                 self.relay_wakeup.clear()
                 continue
             if not registered:
@@ -610,6 +692,13 @@ class DroidLinkBridge:
                     event["message"] = str(payload.get("message", ""))[:200]
             elif event_type == "photo_error":
                 event = {"type": event_type, "message": str(payload.get("message", ""))[:240]}
+            elif event_type == "photo_delete_result":
+                event = {
+                    "type": event_type,
+                    "id": self._bounded_int(payload.get("id", 0), 0, 2**63 - 1),
+                    "success": bool(payload.get("success", False)),
+                    "message": str(payload.get("message", ""))[:240],
+                }
             elif event_type == "app_icons":
                 items = []
                 source_items = payload.get("items", [])

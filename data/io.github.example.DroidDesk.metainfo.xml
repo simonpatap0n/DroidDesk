@@ -17,6 +17,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.0" date="2026-11-25">
+      <description>
+        <p>Ajoute le choix du domaine HTTPS privé pour DroidLink sur le bureau et Android, et documente le déploiement du relais avec Docker Compose et Nginx Proxy Manager.</p>
+        <p>Ajoute la suppression des photos avec confirmation sur Android et le montage du stockage dans Nautilus par ADB Wi-Fi et madbfs. Améliore le contrôle scrcpy intégré, la fenêtre scrcpy native, le défilement à la molette et la récupération des icônes d’applications.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-11-25">
       <description>
         <p>Ajoute un relais DroidLink auto-hébergé, des diagnostics de connexion et une tuile Android pour ouvrir DroidLink depuis le panneau rapide. ADB découvre les téléphones déjà appairés en Wi-Fi par mDNS. Améliore la lecture et la mise en cache des conversations et médias.</p>

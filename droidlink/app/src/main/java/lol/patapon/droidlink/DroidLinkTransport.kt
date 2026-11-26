@@ -3,6 +3,7 @@ package lol.patapon.droidlink
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -11,26 +12,44 @@ internal object DroidLinkTransport {
     const val SESSION_TOKEN_KEY = "session_token"
     const val SESSION_ID_KEY = "relay_session_id"
     const val RELAY_URL_KEY = "relay_url"
-    const val DEFAULT_RELAY_URL = "https://droidlink.patapon.lol"
+
+    fun relayUrl(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString(RELAY_URL_KEY, "")
+        .orEmpty()
+        .trimEnd('/')
+
+    fun normalizeRelayUrl(value: String): String? {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) return null
+        val candidate = if ("://" in trimmed) trimmed else "https://$trimmed"
+        val uri = runCatching { URI(candidate) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        if (uri.scheme != "https" || uri.userInfo != null || uri.query != null || uri.fragment != null) return null
+        if (uri.path.isNotEmpty() && uri.path != "/") return null
+        if (!host.contains('.') || host.any { it.isWhitespace() }) return null
+        if (uri.port > 65_535) return null
+        val port = uri.port.takeIf { it >= 0 }?.let { ":$it" }.orEmpty()
+        return "https://${host.lowercase()}$port"
+    }
 
     private fun baseUrl(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(RELAY_URL_KEY, DEFAULT_RELAY_URL)
-            .orEmpty()
-            .trimEnd('/')
+        relayUrl(context)
 
     private fun sessionUrl(context: Context, route: String): String? {
+        val base = baseUrl(context).takeIf { it.isNotBlank() } ?: return null
         val sessionId = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(SESSION_ID_KEY, null)
             ?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{20,64}")) }
             ?: return null
-        return "${baseUrl(context)}/v1/sessions/$sessionId/$route"
+        return "$base/v1/sessions/$sessionId/$route"
     }
 
     private fun sessionRoute(route: String): String = "/v1/sessions/{id}/${route.substringBefore('?')}"
 
     fun checkHealth(context: Context): Boolean {
-        val connection = URL("${baseUrl(context)}/healthz").openConnection() as HttpURLConnection
+        val base = baseUrl(context)
+        if (base.isBlank()) return false
+        val connection = URL("$base/healthz").openConnection() as HttpURLConnection
         return try {
             connection.requestMethod = "GET"
             connection.connectTimeout = 4_000

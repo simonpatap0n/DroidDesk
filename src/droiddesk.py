@@ -97,6 +97,15 @@ APP_CSS = """
 .droiddesk-window .connection-indicator.connection-state-idle image {
   color: @dim_label_fg_color;
 }
+.droiddesk-window .connection-indicator.droidlink-state-online image {
+  color: #2ec27e;
+}
+.droiddesk-window .connection-indicator.droidlink-state-warning image {
+  color: #e5a50a;
+}
+.droiddesk-window .connection-indicator.droidlink-state-error image {
+  color: #e01b24;
+}
 .droiddesk-window .primary-tabs {
   padding: 9px 24px 8px;
   min-height: 52px;
@@ -302,9 +311,11 @@ APP_CSS = """
 }
 """
 ADB_CANDIDATES = (
-    Path.home() / ".local/bin/adb",
-    Path.home() / ".local/share/android-sdk/platform-tools/adb",
+    Path(os.environ.get("ANDROID_SDK_ROOT", "/nonexistent")) / "platform-tools/adb",
+    Path(os.environ.get("ANDROID_HOME", "/nonexistent")) / "platform-tools/adb",
     Path.home() / "Android/Sdk/platform-tools/adb",
+    Path.home() / ".local/share/android-sdk/platform-tools/adb",
+    Path.home() / ".local/bin/adb",
     Path("/usr/bin/adb"),
     Path("/usr/local/bin/adb"),
 )
@@ -347,6 +358,27 @@ def find_executable(name, candidates):
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def find_adb_executable():
+    paths = list(ADB_CANDIDATES)
+    found = shutil.which("adb")
+    if found:
+        paths.append(Path(found))
+    versions = []
+    for candidate in dict.fromkeys(paths):
+        if not candidate.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [str(candidate), "version"], capture_output=True, text=True, timeout=3, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        match = re.search(r"^Version\s+(\d+(?:\.\d+)+)", result.stdout, re.MULTILINE)
+        version = tuple(int(part) for part in match.group(1).split(".")) if match else (0,)
+        versions.append((version, str(candidate)))
+    return str(max(versions)[1]) if versions else found
 
 
 def deep_unpack(value):
@@ -670,14 +702,24 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def __init__(self, application):
         super().__init__(application=application)
         self.set_title("DroidDesk")
-        self.set_default_size(1180, 780)
-        self.adb = find_executable("adb", ADB_CANDIDATES)
+        self.set_default_size(1180, 920)
+        self.adb = find_adb_executable()
+        self.adb_version = ""
+        if self.adb:
+            try:
+                version_result = subprocess.run(
+                    [self.adb, "version"], capture_output=True, text=True, timeout=3, check=False,
+                )
+                version_match = re.search(r"^Version\s+([^\s]+)", version_result.stdout, re.MULTILINE)
+                self.adb_version = version_match.group(1) if version_match else ""
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         self.scrcpy = find_executable("scrcpy", SCRCPY_CANDIDATES)
+        self.scrcpy_processes = {}
         self.scrcpy_server = find_executable("scrcpy-server", SCRCPY_SERVER_CANDIDATES)
         self.madbfs = find_executable("madbfs", MADBFS_CANDIDATES)
         self.devices = []
         self.adb_mdns_devices = []
-        self.android_wifi_connected = None
         self.device_profiles = {}
         self.contacts = []
         self.contacts_loaded = False
@@ -781,6 +823,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         except OSError as error:
             self.droidlink_bridge = None
             self._set_status(f"DroidLink indisponible : {error}", True)
+        if self.droidlink_bridge:
+            self.droidlink_relay_entry.set_text(self.droidlink_bridge.relay_url)
         self.droidlink_timer = GLib.timeout_add_seconds(1, self._droidlink_timer_tick)
         self.connect("close-request", self._on_close)
         self._update_controls()
@@ -840,9 +884,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.connection_buttons = {}
         self.connection_icons = {}
         for key, title, icon_name, page in (
-            ("wifi", "Wi-Fi", "network-wireless-signal-none-symbolic", "adb"),
             ("bluetooth", "Bluetooth", "bluetooth-disabled-symbolic", "bluetooth"),
             ("adb", "ADB", "utilities-terminal-symbolic", "adb"),
+            ("droidlink", "DroidLink", "network-server-symbolic", "droidlink"),
         ):
             button = Gtk.Button()
             button.add_css_class("flat")
@@ -855,33 +899,33 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.connection_buttons[key] = button
             self.connection_icons[key] = icon
 
-        self.connection_settings_popover = Gtk.Popover()
-        self.connection_settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        self.connection_settings_box.add_css_class("tools-popover")
-        settings_title = Gtk.Label(label="Préférences de connexion", xalign=0)
+        self.settings_popover = Gtk.Popover()
+        self.settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.settings_box.add_css_class("tools-popover")
+        settings_title = Gtk.Label(label="Configuration", xalign=0)
         settings_title.add_css_class("heading")
-        self.connection_settings_box.append(settings_title)
-        for title, icon_name, page in (
-            ("Bluetooth", "bluetooth-symbolic", "bluetooth"),
-            ("Wi-Fi et ADB sans fil", "network-wireless-symbolic", "adb"),
-        ):
-            button = Gtk.Button()
-            button.add_css_class("flat")
-            setting_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
-            setting_content.set_margin_start(4)
-            setting_content.set_margin_end(4)
-            setting_content.append(Gtk.Image.new_from_icon_name(icon_name))
-            setting_content.append(Gtk.Label(label=title, xalign=0))
-            button.set_child(setting_content)
-            button.connect("clicked", lambda _button, target=page: self._show_tool_page(target))
-            self.connection_settings_box.append(button)
-        self.connection_settings_popover.set_child(self.connection_settings_box)
-        self.connection_settings_button = Gtk.MenuButton.new()
-        self.connection_settings_button.set_child(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
-        self.connection_settings_button.set_tooltip_text("Préférences Bluetooth, Wi-Fi et ADB")
-        self.connection_settings_button.set_popover(self.connection_settings_popover)
-        self.connection_settings_button.add_css_class("flat")
-        right_actions.append(self.connection_settings_button)
+        self.settings_box.append(settings_title)
+        self.settings_box.append(Gtk.Label(label="Relais HTTPS DroidLink", xalign=0))
+        self.droidlink_relay_entry = Gtk.Entry()
+        self.droidlink_relay_entry.set_placeholder_text("relay.example.net")
+        self.droidlink_relay_entry.set_text(getattr(getattr(self, "droidlink_bridge", None), "relay_url", ""))
+        self.droidlink_relay_entry.set_width_chars(28)
+        self.droidlink_relay_entry.set_tooltip_text("Nom de domaine HTTPS du relais auto-hébergé")
+        self.settings_box.append(self.droidlink_relay_entry)
+        self.settings_hint = Gtk.Label(label="Dissocie le téléphone avant de changer de domaine.", xalign=0)
+        self.settings_hint.add_css_class("dim-label")
+        self.settings_hint.set_wrap(True)
+        self.settings_box.append(self.settings_hint)
+        self.droidlink_relay_save_button = Gtk.Button(label="Enregistrer le domaine")
+        self.droidlink_relay_save_button.connect("clicked", self._save_droidlink_relay_domain)
+        self.settings_box.append(self.droidlink_relay_save_button)
+        self.settings_popover.set_child(self.settings_box)
+        self.settings_button = Gtk.MenuButton.new()
+        self.settings_button.set_child(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
+        self.settings_button.set_tooltip_text("Configuration de DroidDesk")
+        self.settings_button.set_popover(self.settings_popover)
+        self.settings_button.add_css_class("flat")
+        right_actions.append(self.settings_button)
 
         about_button = Gtk.Button.new_from_icon_name("help-about-symbolic")
         about_button.set_tooltip_text("À propos")
@@ -897,9 +941,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_hexpand(True)
         self.stack.set_vexpand(True)
-        self.primary_page_names = ("calls", "contacts", "sms", "gallery", "screen")
+        self.primary_page_names = ("calls", "contacts", "sms", "gallery", "screen", "files")
         self.primary_tab_buttons = {}
-        self.tool_buttons = {}
         self.navigation_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.navigation_panel.add_css_class("app-sidebar")
         self.navigation_panel.set_size_request(210, -1)
@@ -1011,6 +1054,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             ("sms", "Messages", "mail-message-new-symbolic"),
             ("gallery", "Photos", "image-x-generic-symbolic"),
             ("screen", "Applications", "applications-graphics-symbolic"),
+            ("files", "Fichier", "folder-symbolic"),
         ):
             button = Gtk.Button()
             button.add_css_class("flat")
@@ -1023,22 +1067,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.primary_tabs.append(button)
             self.primary_tab_buttons[name] = button
 
-        self.tools_popover = Gtk.Popover()
-        self.tools_menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        self.tools_menu_box.add_css_class("tools-popover")
-        self.tools_menu_title = Gtk.Label(label="Plus", xalign=0)
-        self.tools_menu_title.add_css_class("heading")
-        self.tools_menu_box.append(self.tools_menu_title)
-        self.tools_popover.set_child(self.tools_menu_box)
-        self.tools_menu_button = Gtk.MenuButton.new()
-        tools_button_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
-        tools_button_content.append(Gtk.Image.new_from_icon_name("view-more-symbolic"))
-        tools_button_content.append(Gtk.Label(label="Plus"))
-        self.tools_menu_button.set_child(tools_button_content)
-        self.tools_menu_button.set_popover(self.tools_popover)
-        self.tools_menu_button.add_css_class("flat")
-        self.tools_menu_button.add_css_class("primary-tab")
-        self.primary_tabs.append(self.tools_menu_button)
         main_panel.append(self.primary_tabs)
         main_panel.append(self.stack)
 
@@ -1090,25 +1118,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self._render_notification_sidebar()
 
     def _add_stack_page(self, child, name, title, icon_name, section):
-        if name in self.primary_page_names:
-            button = self.primary_tab_buttons[name]
-        else:
-            button = Gtk.Button()
-            button.add_css_class("flat")
-            content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
-            content.set_margin_start(4)
-            content.set_margin_end(4)
-            image = Gtk.Image.new_from_icon_name(icon_name)
-            image.set_pixel_size(18)
-            content.append(image)
-            label = Gtk.Label(label=title, xalign=0)
-            label.set_hexpand(True)
-            content.append(label)
-            button.set_child(content)
-            button.connect("clicked", lambda _button, page=name: self._show_tool_page(page))
-            self.tools_menu_box.append(button)
-            self.tool_buttons[name] = button
-
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_child(child)
@@ -1116,10 +1125,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _show_tool_page(self, page_name):
         self.stack.set_visible_child_name(page_name)
-        for popover_name in ("tools_popover", "connection_settings_popover"):
-            popover = getattr(self, popover_name, None)
-            if popover:
-                popover.popdown()
+        if getattr(self, "settings_popover", None):
+            self.settings_popover.popdown()
 
     def _sync_navigation_selection(self):
         page_name = self.stack.get_visible_child_name()
@@ -1128,14 +1135,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 button.add_css_class("primary-tab-selected")
             else:
                 button.remove_css_class("primary-tab-selected")
-        if page_name in self.tool_buttons:
-            self.tools_menu_button.add_css_class("primary-tab-selected")
-        else:
-            self.tools_menu_button.remove_css_class("primary-tab-selected")
-        if page_name in ("bluetooth", "adb"):
-            self.connection_settings_button.add_css_class("primary-tab-selected")
-        else:
-            self.connection_settings_button.remove_css_class("primary-tab-selected")
 
     def _build_droidlink_page(self):
         page = self._page()
@@ -1172,7 +1171,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         pairing = Adw.PreferencesGroup.new()
         pairing.set_title("Téléphone compagnon")
-        pairing.set_description("Relais HTTPS : droidlink.patapon.lol. Code à usage unique, valide deux minutes.")
+        pairing.set_description("Relais HTTPS auto-hébergé. Le code est à usage unique et reste valide deux minutes.")
         self.droidlink_status = Gtk.Label(label="Aucun téléphone DroidLink associé.", xalign=0)
         self.droidlink_status.set_wrap(True)
         self.droidlink_status.add_css_class("dim-label")
@@ -1472,6 +1471,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.bt_device_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.bt_device_list.add_css_class("boxed-list")
         bt_scroll = Gtk.ScrolledWindow()
+        bt_scroll.set_min_content_height(320)
+        bt_scroll.set_max_content_height(440)
         bt_scroll.set_vexpand(True)
         bt_scroll.set_child(self.bt_device_list)
         page.append(bt_scroll)
@@ -1508,8 +1509,8 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.adb_devices_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.adb_devices_list.add_css_class("boxed-list")
         adb_devices_scroll = Gtk.ScrolledWindow()
-        adb_devices_scroll.set_min_content_height(60)
-        adb_devices_scroll.set_max_content_height(190)
+        adb_devices_scroll.set_min_content_height(112)
+        adb_devices_scroll.set_max_content_height(148)
         adb_devices_scroll.set_child(self.adb_devices_list)
         self.adb_devices_group.add(adb_devices_scroll)
         page.append(self.adb_devices_group)
@@ -1556,6 +1557,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         page.append(wireless)
 
         advanced_expander = Gtk.Expander.new("Outils avancés")
+        advanced_expander.set_expanded(True)
         advanced_contents = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         advanced_expander.set_child(advanced_contents)
         page.append(advanced_expander)
@@ -1989,7 +1991,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         page_header.append(title)
         self.scrcpy_button = Gtk.Button(label="scrcpy")
         self.scrcpy_button.add_css_class("flat")
-        self.scrcpy_button.set_tooltip_text("Afficher et contrôler l’écran dans DroidDesk")
+        self.scrcpy_button.set_tooltip_text("Ouvrir l’écran dans la fenêtre native scrcpy")
         self.scrcpy_button.connect("clicked", self._start_scrcpy)
         page_header.append(self.scrcpy_button)
         page.append(page_header)
@@ -2005,6 +2007,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.embedded_app_title.add_css_class("heading")
         self.embedded_app_title.set_hexpand(True)
         viewer_toolbar.append(self.embedded_app_title)
+        self.embedded_popup_button = Gtk.Button(label="Pop-up scrcpy")
+        self.embedded_popup_button.set_icon_name("window-new-symbolic")
+        self.embedded_popup_button.set_tooltip_text("Ouvrir aussi l’écran dans la fenêtre native scrcpy")
+        self.embedded_popup_button.connect("clicked", self._open_native_scrcpy_popup)
+        viewer_toolbar.append(self.embedded_popup_button)
         for label, keycode, tooltip in (
             ("Retour", "KEYCODE_BACK", "Retour Android"),
             ("Accueil", "KEYCODE_HOME", "Accueil Android"),
@@ -2026,6 +2033,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.embedded_picture.set_vexpand(True)
         self.embedded_picture.set_focusable(True)
         self.embedded_picture.add_css_class("embedded-screen-picture")
+        self.embedded_pointer_position = None
+        pointer = Gtk.EventControllerMotion.new()
+        pointer.connect("motion", self._embedded_pointer_motion)
+        self.embedded_picture.add_controller(pointer)
+        scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
+        scroll.connect("scroll", self._embedded_scroll)
+        self.embedded_picture.add_controller(scroll)
         drag = Gtk.GestureDrag.new()
         drag.connect("drag-begin", self._embedded_drag_begin)
         drag.connect("drag-end", self._embedded_drag_end)
@@ -2984,8 +2998,24 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self._set_status("Le client DroidLink n’a pas pu démarrer.", True)
             return
         code = self.droidlink_bridge.begin_pairing()
+        if not code:
+            self._set_status("Configure le domaine HTTPS du relais dans le menu Configuration.", True)
+            return
         self.droidlink_code_label.set_text(f"{code[:3]} {code[3:]}")
         self._set_status("Enregistrement de l’association auprès du relais HTTPS…")
+        self._droidlink_state_changed()
+
+    def _save_droidlink_relay_domain(self, *_args):
+        if not self.droidlink_bridge:
+            self._set_status("Le client DroidLink n’a pas pu démarrer.", True)
+            return
+        saved, detail = self.droidlink_bridge.configure_relay_url(self.droidlink_relay_entry.get_text())
+        self.settings_hint.set_text(detail)
+        if saved:
+            self.droidlink_relay_entry.set_text(self.droidlink_bridge.relay_url)
+            self._set_status(detail)
+        else:
+            self._set_status(detail, True)
         self._droidlink_state_changed()
 
     def _disconnect_droidlink(self, *_args):
@@ -3064,7 +3094,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             color, label = "#9a9996", "Vérification du relais…"
         self.droidlink_relay_indicator.set_markup(f'<span foreground="{color}">●</span>')
         self.droidlink_relay_status.set_text(label)
-        self.droidlink_relay_url.set_text(state.get("relay_url") or "Relais HTTPS")
+        self.droidlink_relay_url.set_text(state.get("relay_url") or "Relais HTTPS non configuré · ouvre Configuration")
 
         entries = tuple(
             (entry.get("timestamp", 0), entry.get("route", ""), entry.get("detail", ""), entry.get("success"))
@@ -3177,6 +3207,14 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 self.gallery_requested_previews.discard(photo_id)
             except (TypeError, ValueError):
                 pass
+            return GLib.SOURCE_REMOVE
+        if event.get("type") == "photo_delete_result":
+            photo_id = int(event.get("id", 0) or 0)
+            photo = next((item for item in self.gallery_photos if int(item.get("id", 0) or 0) == photo_id), None)
+            if event.get("success") and photo:
+                self._finish_gallery_photo_delete(photo)
+            else:
+                self._set_status(event.get("message") or "La suppression a été annulée sur le téléphone.", True)
             return GLib.SOURCE_REMOVE
         if event.get("type") == "command_result":
             if event.get("action") != "dismiss":
@@ -3879,13 +3917,21 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+):\d+", serial)
         )
 
+    @staticmethod
+    def _adb_serial_endpoint(serial):
+        match = re.fullmatch(r"(?:\[([0-9a-fA-F:]+)\]|([A-Za-z0-9._-]+)):(\d+)", str(serial or ""))
+        if not match:
+            return ""
+        address = match.group(1) or match.group(2)
+        return f"IP {address} · port {match.group(3)}"
+
     def _set_connection_status(self, key, text, active, tooltip, icon_name):
         button = self.connection_buttons.get(key)
         icon = self.connection_icons.get(key)
         if not button or not icon:
             return
         icon.set_from_icon_name(icon_name)
-        title = {"wifi": "Wi-Fi", "bluetooth": "Bluetooth", "adb": "ADB"}.get(key, key)
+        title = {"bluetooth": "Bluetooth", "adb": "ADB", "droidlink": "DroidLink"}.get(key, key)
         button.set_tooltip_text(f"{title} · {text}. {tooltip} Cliquez pour ouvrir les préférences.")
         button.remove_css_class("connection-state-active")
         button.remove_css_class("connection-state-idle")
@@ -3915,27 +3961,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             "adb", adb_text, adb_active, adb_tip, "utilities-terminal-symbolic"
         )
 
-        wireless = self._adb_serial_is_wireless(serial)
-        android_wifi = getattr(self, "android_wifi_connected", None)
-        if active and wireless:
-            wifi_text, wifi_tip, wifi_active = "Connecté", "Téléphone relié à ADB par le réseau Wi-Fi.", True
-        elif active and android_wifi is True:
-            wifi_text, wifi_tip, wifi_active = "Connecté", "Le Wi-Fi du téléphone est connecté.", True
-        elif active and android_wifi is False:
-            wifi_text, wifi_tip, wifi_active = "Déconnecté", "Le Wi-Fi du téléphone n’a pas de route réseau active.", False
-        elif state and wireless:
-            wifi_text, wifi_tip, wifi_active = "Hors ligne", "Le lien ADB Wi-Fi est connu, mais le téléphone ne répond pas.", False
-        elif active:
-            wifi_text, wifi_tip, wifi_active = "Déconnecté", "Le téléphone est accessible par ADB, mais son Wi-Fi ne semble pas connecté.", False
-        else:
-            wifi_text, wifi_tip, wifi_active = "Déconnecté", "Aucun lien ADB Wi-Fi actif.", False
-        wifi_icon = (
-            "network-wireless-signal-excellent-symbolic"
-            if wifi_active
-            else "network-wireless-signal-none-symbolic"
-        )
-        self._set_connection_status("wifi", wifi_text, wifi_active, wifi_tip, wifi_icon)
-
         adapters = [
             props
             for interfaces in getattr(getattr(self, "bluez", None), "objects", {}).values()
@@ -3959,6 +3984,48 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             bt_text, bt_tip, bt_active = "Éteint", "Le contrôleur Bluetooth est désactivé.", False
             bt_icon = "bluetooth-disabled-symbolic"
         self._set_connection_status("bluetooth", bt_text, bt_active, bt_tip, bt_icon)
+        self._refresh_droidlink_indicator()
+
+    def _refresh_droidlink_indicator(self):
+        button = self.connection_buttons.get("droidlink")
+        icon = self.connection_icons.get("droidlink")
+        if not button or not icon:
+            return
+        state = self.droidlink_bridge.snapshot() if self.droidlink_bridge else {}
+        if state.get("online"):
+            phone = state.get("phone", {})
+            details = "Téléphone en ligne par le relais DroidLink."
+            if not phone.get("notificationAccess"):
+                details += " L’accès aux notifications est désactivé sur Android."
+            status_class = "droidlink-state-online"
+            status = "En ligne"
+        elif state.get("relay_error") or state.get("relay_reachable") is False:
+            details = state.get("relay_error") or "Le relais DroidLink est inaccessible."
+            status_class = "droidlink-state-error"
+            status = "Erreur"
+        elif state.get("paired"):
+            details = "Téléphone associé, mais hors ligne du relais DroidLink."
+            status_class = "droidlink-state-warning"
+            status = "Téléphone hors ligne"
+        elif state.get("code"):
+            details = "Association DroidLink en cours; saisis le code sur le téléphone."
+            status_class = "droidlink-state-warning"
+            status = "Association en cours"
+        else:
+            details = "Aucun téléphone associé à DroidLink."
+            status_class = "connection-state-idle"
+            status = "Non associé"
+        icon.set_from_icon_name("network-server-symbolic")
+        button.set_tooltip_text(f"DroidLink · {status}. {details} Clique pour ouvrir DroidLink.")
+        for name in (
+            "connection-state-active",
+            "connection-state-idle",
+            "droidlink-state-online",
+            "droidlink-state-warning",
+            "droidlink-state-error",
+        ):
+            button.remove_css_class(name)
+        button.add_css_class(status_class)
 
     def _update_controls(self):
         active = self._active_device() is not None
@@ -4082,7 +4149,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if self.gallery_prefetch_timer:
             GLib.source_remove(self.gallery_prefetch_timer)
             self.gallery_prefetch_timer = 0
-        self.android_wifi_connected = None
         if self.embedded_stream_serial and (not active or self.embedded_stream_serial != active[0]):
             self._close_embedded_viewer()
         self._update_controls()
@@ -4219,17 +4285,28 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                     check=False,
                 )
                 if discovery.returncode == 0:
-                    for line in discovery.stdout.splitlines():
-                        if "_adb-tls-connect._tcp" not in line:
-                            continue
-                        for field in line.split()[1:]:
-                            if re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+):\d+", field):
-                                endpoints.append(field)
-                                break
+                    endpoints.extend(self._parse_adb_mdns_services(discovery.stdout))
                 else:
                     discovery_error = (discovery.stderr or discovery.stdout).strip()
             except (OSError, subprocess.TimeoutExpired) as error:
                 discovery_error = str(error)
+            if not endpoints:
+                try:
+                    tracked = subprocess.run(
+                        [self.adb, "mdns", "track-services", "--proto-text"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.5,
+                        check=False,
+                    )
+                    endpoints.extend(self._parse_adb_mdns_services(tracked.stdout))
+                except subprocess.TimeoutExpired as exc:
+                    tracked_output = exc.stdout or ""
+                    if isinstance(tracked_output, bytes):
+                        tracked_output = tracked_output.decode("utf-8", errors="replace")
+                    endpoints.extend(self._parse_adb_mdns_services(tracked_output))
+                except OSError as exc:
+                    discovery_error = str(exc)
 
             connected_endpoints = []
             for endpoint in list(dict.fromkeys(endpoints))[:5]:
@@ -4323,33 +4400,116 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 mdns_error = None
             except (OSError, subprocess.TimeoutExpired) as exc:
                 mdns, mdns_error = None, str(exc)
+            if not self._parse_adb_mdns_services(mdns.stdout if mdns else ""):
+                try:
+                    tracked = subprocess.run(
+                        [self.adb, "mdns", "track-services", "--proto-text"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.5,
+                        check=False,
+                    )
+                    if tracked.stdout:
+                        mdns = tracked
+                        mdns_error = None
+                    elif tracked.returncode != 0:
+                        mdns_error = (tracked.stderr or tracked.stdout).strip() or mdns_error
+                except subprocess.TimeoutExpired as exc:
+                    tracked_output = exc.stdout or ""
+                    if isinstance(tracked_output, bytes):
+                        tracked_output = tracked_output.decode("utf-8", errors="replace")
+                    if tracked_output:
+                        mdns = subprocess.CompletedProcess(
+                            [self.adb, "mdns", "track-services", "--proto-text"],
+                            0,
+                            stdout=tracked_output,
+                            stderr="",
+                        )
+                except OSError as exc:
+                    mdns_error = str(exc)
             GLib.idle_add(self._adb_devices_scan_result, devices, error, mdns, mdns_error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _adb_devices_scan_result(self, devices, error, mdns, mdns_error):
         self._set_busy(False)
-        discovered = {}
-        if mdns and mdns.returncode == 0:
-            for line in mdns.stdout.splitlines():
-                if "_adb-tls-connect._tcp" not in line:
-                    continue
-                fields = line.split()
-                endpoint = next(
-                    (
-                        field for field in fields[1:]
-                        if re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+):\d+", field)
-                    ),
-                    None,
-                )
-                if not endpoint:
-                    continue
-                service_name = fields[0].split("._adb", 1)[0].removeprefix("adb-").strip(" .")
-                discovered[endpoint] = service_name or "Téléphone Android"
+        discovered = self._parse_adb_mdns_services(mdns.stdout if mdns and mdns.returncode == 0 else "")
         self.adb_mdns_devices = list(discovered.items())
-        scan_error = error if devices is not None else (error or mdns_error)
-        self._devices_result(devices, scan_error)
+        self._devices_result(devices, error)
+        if error or not devices or devices.returncode != 0:
+            return GLib.SOURCE_REMOVE
+        if mdns_error or not mdns or mdns.returncode != 0:
+            detail = mdns_error or ((mdns.stderr or mdns.stdout).strip() if mdns else "ADB n’a pas retourné de résultat mDNS.")
+            version = f" (ADB {self.adb_version})" if self.adb_version else ""
+            self._set_status(f"ADB actualisé{version}, mais la découverte mDNS a échoué : {detail[:160]}. Vérifie Platform Tools et le même Wi-Fi.", True)
+        elif not discovered:
+            version_match = re.match(r"(\d+)(?:\.|$)", self.adb_version)
+            version_hint = (
+                f" ADB {self.adb_version} est installé; Android 17 demande Platform Tools 37+ pour ADB Wi-Fi 2.0."
+                if version_match and int(version_match.group(1)) < 37
+                else " Vérifie que `adb server-status` indique `mdns_enabled: true`."
+            )
+            self._set_status(
+                "ADB actualisé · aucun téléphone appairé annoncé par mDNS. Vérifie Débogage sans fil et le même Wi-Fi."
+                + version_hint
+            )
         return GLib.SOURCE_REMOVE
+
+    @staticmethod
+    def _parse_adb_mdns_services(output):
+        discovered = {}
+        service = None
+
+        def save_service(fields):
+            if fields.get("service", "").strip('"') != "_adb-tls-connect._tcp":
+                return
+            port = fields.get("port", "").strip('"')
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                return
+            address = fields.get("ipv4", "").strip('"') or fields.get("hostname", "").strip('"')
+            if not address:
+                address = fields.get("ipv6", "").strip('"')
+                if address:
+                    address = f"[{address}]"
+            if not address:
+                return
+            endpoint = f"{address}:{port}"
+            name = (
+                fields.get("given_name", "")
+                or fields.get("product_model", "")
+                or fields.get("instance", "")
+            ).strip('"')
+            discovered[endpoint] = name or "Téléphone Android"
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped == "service {":
+                service = {}
+                continue
+            if service is not None:
+                if stripped == "}":
+                    save_service(service)
+                    service = None
+                    continue
+                match = re.match(r'([A-Za-z0-9_]+):\s*(?:"([^"]*)"|([^#]+?))\s*$', stripped)
+                if match:
+                    service[match.group(1)] = (match.group(2) or match.group(3) or "").strip()
+                continue
+
+            if "_adb-tls-connect._tcp" not in stripped:
+                continue
+            fields = stripped.split()
+            endpoint = next(
+                (
+                    field.rstrip(".") for field in fields[1:]
+                    if re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+):\d+\.?", field)
+                ),
+                None,
+            )
+            if endpoint:
+                name = fields[0].split("._adb", 1)[0].removeprefix("adb-").strip(" .")
+                discovered[endpoint] = name or "Téléphone Android"
+        return discovered
 
     def _render_adb_device_list(self):
         if not hasattr(self, "adb_devices_list"):
@@ -4374,9 +4534,24 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         for serial, state, model in self.devices:
             row = Adw.ActionRow.new()
             row.add_css_class("adb-device-row")
-            row.set_title(GLib.markup_escape_text(model or serial))
+            profile = self.device_profiles.get(serial, {})
+            profile_model = str(profile.get("model") or "").strip().replace("_", " ")
+            manufacturer = str(profile.get("manufacturer") or "").strip()
+            if manufacturer.casefold() in ("android", "unknown"):
+                manufacturer = ""
+            if manufacturer and profile_model and manufacturer.casefold() not in profile_model.casefold():
+                device_name = f"{manufacturer.title()} {profile_model}"
+            else:
+                device_name = profile_model or model or serial
+            row.set_title(GLib.markup_escape_text(device_name))
             if state == "device":
-                connection = "Connecté · ADB Wi-Fi" if self._adb_serial_is_wireless(serial) else "Connecté · USB"
+                if self._adb_serial_is_wireless(serial):
+                    endpoint = self._adb_serial_endpoint(serial)
+                    connection = f"Connecté · ADB Wi-Fi · {endpoint}" if endpoint else "Connecté · ADB Wi-Fi"
+                else:
+                    connection = "Connecté · USB"
+                if profile.get("android"):
+                    connection += f" · Android {profile['android']}"
             elif state == "unauthorized":
                 connection = "Autorisation à confirmer sur Android"
             elif state == "offline":
@@ -4536,7 +4711,6 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             for name, args in (
                 ("battery", ["shell", "dumpsys", "battery"]),
                 ("storage", ["shell", "df", "-h", "/sdcard"]),
-                ("wifi", ["shell", "ip", "route"]),
             ):
                 try:
                     result = subprocess.run(
@@ -4557,12 +4731,11 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 error,
                 status_outputs.get("battery", ""),
                 status_outputs.get("storage", ""),
-                status_outputs.get("wifi"),
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _device_profile_result(self, serial, output, error, battery_output="", storage_output="", wifi_output=None):
+    def _device_profile_result(self, serial, output, error, battery_output="", storage_output=""):
         self.phone_profile_loading.discard(serial)
         if not self._active_device() or self._active_device()[0] != serial:
             return GLib.SOURCE_REMOVE
@@ -4595,9 +4768,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             storage_text = f"Stockage · {storage_values[2]} / {storage_values[1]} utilisés"
         self.phone_storage_label.set_text(storage_text)
         self.phone_storage_label.set_visible(bool(storage_text))
-        self.android_wifi_connected = (
-            bool(re.search(r"\bdev\s+wlan\d+\b", wifi_output)) if wifi_output is not None else None
-        )
+        self._render_adb_device_list()
         self._refresh_connection_summary()
         self._refresh_call_summary()
         return GLib.SOURCE_REMOVE
@@ -5976,7 +6147,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         serial = active[0]
         self._run_adb_command(
             ["shell", "monkey", "-p", "com.google.android.apps.messaging", "1"],
-            "Ouverture de Google Messages dans l’écran DroidDesk…",
+            "Ouverture de Google Messages sur le téléphone…",
             lambda result, error: self._google_messages_opened_in_droiddesk(serial, result, error),
             timeout=20,
         )
@@ -6806,7 +6977,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
     def _start_scrcpy(self, *_args):
         active = self._active_device()
         if active:
-            self._launch_scrcpy(active[0])
+            self._launch_scrcpy_native(active[0])
 
     def _launch_scrcpy(self, serial, title=None):
         if not self.scrcpy:
@@ -6849,6 +7020,59 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         ).start()
         self._set_status("Préparation du flux vidéo scrcpy intégré…")
         return True
+
+    def _open_native_scrcpy_popup(self, *_args):
+        serial = self.embedded_stream_serial or (self._active_device() or (None,))[0]
+        if not serial:
+            self._set_status("Connecte un téléphone ADB avant d’ouvrir scrcpy.", True)
+            return
+        self._launch_scrcpy_native(serial, self.embedded_app_title.get_text())
+
+    def _launch_scrcpy_native(self, serial, title=None):
+        if not self.scrcpy:
+            self._set_status("scrcpy est introuvable. Installez scrcpy, puis actualisez l’application.", True)
+            return False
+        current = self.scrcpy_processes.get(serial)
+        if current and current.poll() is None:
+            self._set_status(f"La fenêtre scrcpy native de {serial} est déjà ouverte.")
+            return True
+        command = [self.scrcpy, "--serial", serial]
+        if title:
+            command.extend(("--window-title", title))
+        environment = os.environ.copy()
+        if self.adb:
+            environment["ADB"] = self.adb
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=environment,
+                start_new_session=True,
+            )
+        except OSError as error:
+            self._set_status(f"Impossible de lancer scrcpy : {error}", True)
+            return False
+        self.scrcpy_processes[serial] = process
+        threading.Thread(target=self._wait_for_scrcpy, args=(serial, process), daemon=True).start()
+        self._set_status(f"Fenêtre native scrcpy ouverte · {serial}")
+        return True
+
+    def _wait_for_scrcpy(self, serial, process):
+        try:
+            _stdout, stderr = process.communicate()
+        except (OSError, ValueError):
+            stderr = b""
+        detail = stderr.decode("utf-8", errors="replace").strip() if isinstance(stderr, bytes) else str(stderr or "").strip()
+        GLib.idle_add(self._scrcpy_finished, serial, process, process.returncode, detail[:320])
+
+    def _scrcpy_finished(self, serial, process, returncode, detail):
+        if self.scrcpy_processes.get(serial) is process:
+            self.scrcpy_processes.pop(serial, None)
+        if returncode and detail:
+            self._set_status(f"scrcpy s’est arrêté : {detail}", True)
+        return GLib.SOURCE_REMOVE
 
     def _prepare_embedded_stream(self, serial, title, generation, ffmpeg):
         server = None
@@ -7293,6 +7517,47 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.embedded_picture.grab_focus()
         self.embedded_drag_start = (x, y)
 
+    def _embedded_pointer_motion(self, _controller, x, y):
+        self.embedded_pointer_position = (x, y)
+
+    def _embedded_scroll(self, _controller, delta_x, delta_y):
+        position = self.embedded_pointer_position
+        if not position or not self.embedded_stream_serial:
+            return False
+        point = self._embedded_screen_point(*position)
+        if not point:
+            return False
+
+        axis_delta = delta_y if abs(delta_y) >= abs(delta_x) else delta_x
+        if abs(axis_delta) < 0.01:
+            return False
+        horizontal = abs(delta_y) < abs(delta_x)
+        video_width, video_height = self.embedded_frame_size
+        device_width, device_height = self.embedded_device_size or (video_width, video_height)
+        if (video_width > video_height) != (device_width > device_height):
+            device_width, device_height = device_height, device_width
+        axis_size = device_width if horizontal else device_height
+        if axis_size <= 0:
+            return False
+        magnitude = min(max(abs(axis_delta), 0.5), 2.0)
+        distance = round(min(max(axis_size * 0.18, 100), 500) * magnitude)
+        half_distance = max(1, distance // 2)
+        x, y = point
+        if horizontal:
+            start_x = min(device_width - 1, x + half_distance) if axis_delta > 0 else max(0, x - half_distance)
+            end_x = max(0, x - half_distance) if axis_delta > 0 else min(device_width - 1, x + half_distance)
+            start_y = end_y = y
+        else:
+            start_y = min(device_height - 1, y + half_distance) if axis_delta > 0 else max(0, y - half_distance)
+            end_y = max(0, y - half_distance) if axis_delta > 0 else min(device_height - 1, y + half_distance)
+            start_x = end_x = x
+        if (start_x, start_y) == (end_x, end_y):
+            return False
+        self._send_embedded_input(
+            "swipe", str(start_x), str(start_y), str(end_x), str(end_y), "180"
+        )
+        return True
+
     def _embedded_drag_end(self, _gesture, offset_x, offset_y):
         start = self.embedded_drag_start
         self.embedded_drag_start = None
@@ -7369,6 +7634,9 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _refresh_apps(self):
+        # Retry missing artwork immediately; do not make the icon refresh wait
+        # for the ADB launcher query to finish first.
+        self._request_app_icons()
         self._run_adb_command(
             ["shell", "cmd", "package", "query-activities", "--brief", "--components", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"],
             "Lecture des applications…",
@@ -7410,16 +7678,27 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self._set_status(f"{len(packages)} application(s) utilisateur(s) listée(s).")
 
     def _request_app_icons(self):
+        missing = [package for package in self.app_packages if package not in self.app_icons]
+        if not missing:
+            return
         if not self.droidlink_bridge:
+            self.apps_icon_status.set_text(f"{len(missing)} icône(s) manquante(s) · associe DroidLink pour les récupérer.")
             return
         state = self.droidlink_bridge.snapshot()
         if not state["paired"] or not state["phone"].get("notificationAccess"):
-            return
-        missing = [package for package in self.app_packages if package not in self.app_icons]
-        for start in range(0, len(missing), 10):
-            self.droidlink_bridge.enqueue_command(
-                "app_icons", "", packages=missing[start : start + 10]
+            self.apps_icon_status.set_text(
+                f"{len(missing)} icône(s) manquante(s) · associe DroidLink et autorise l’accès aux notifications sur Android."
             )
+            return
+        queued = 0
+        for start in range(0, len(missing), 10):
+            batch = missing[start : start + 10]
+            if self.droidlink_bridge.enqueue_command("app_icons", "", packages=batch):
+                queued += len(batch)
+        if queued:
+            self.apps_icon_status.set_text(f"Demande de {queued} icône(s) manquante(s) envoyée au téléphone…")
+        else:
+            self.apps_icon_status.set_text("DroidLink n’a pas accepté la demande d’icônes; vérifie l’association.")
 
     def _load_cached_app_icons(self):
         for path in self.app_icon_cache_dir.glob("*.png"):
@@ -8224,19 +8503,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         if not photo_id.isdigit():
             self._set_status("Identifiant de photo Android invalide.", True)
             return
-        self._run_adb_command(
-            ["shell", "content", "delete", "--uri", f"content://media/external/images/media/{photo_id}"],
-            "Suppression de la photo sur le téléphone…",
-            lambda result, error: self._gallery_photo_delete_result(photo, result, error),
-            timeout=45,
-        )
-
-    def _gallery_photo_delete_result(self, photo, result, error):
-        output = (result.stdout or "").strip() if result else ""
-        if error or not result or result.returncode != 0 or not re.search(r"Deleted\s+1\s+rows?", output, re.IGNORECASE):
-            detail = error or ((result.stderr or output).strip() if result else "")
-            self._set_status(f"Suppression impossible : {detail[:220] or output or 'Android n’a confirmé aucune suppression.'}", True)
+        if not self.droidlink_bridge or not self.droidlink_bridge.enqueue_command("photo_delete", photo_id, photoId=photo_id):
+            self._set_status("Associe DroidLink pour supprimer cette photo à distance.", True)
             return
+        self.photos_status.set_text("Confirmation de suppression envoyée au téléphone. Accepte la demande Android pour terminer.")
+        self._set_status("Confirme la suppression sur le téléphone…")
+
+    def _finish_gallery_photo_delete(self, photo):
         photo_id = int(photo.get("id", 0) or 0)
         next_index = max(0, self.gallery_viewer_index)
         for cache_map in (self.gallery_thumbnail_cache_paths, self.gallery_preview_cache_paths):
@@ -8731,7 +9004,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         about = Adw.AboutWindow(transient_for=self)
         about.set_application_name("DroidDesk")
         about.set_application_icon(APP_ID)
-        about.set_version("0.3.0")
+        about.set_version("0.2.0")
         about.set_developer_name("DroidDesk contributors")
         about.set_comments("Téléphone Android, scrcpy et transferts ADB depuis GNOME.")
         about.set_license_type(Gtk.License.GPL_3_0_ONLY)

@@ -12,8 +12,10 @@ import java.io.ByteArrayOutputStream
 
 object DroidLinkAppIcons {
     // Send launcher artwork at a size close to DroidDesk's rendered tile, so
-    // high-DPI desktops do not have to enlarge a tiny thumbnail.
-    private const val ICON_SIZE = 320
+    // high-DPI desktops do not have to enlarge a tiny thumbnail. Fall back to
+    // smaller rasters when needed to stay within the relay's per-icon limit.
+    private const val MAX_ENCODED_ICON_CHARS = 80_000
+    private val ICON_SIZES = intArrayOf(320, 192, 128, 96)
 
     fun sendIcons(context: Context, token: String, packages: JSONArray) {
         val items = JSONArray()
@@ -25,7 +27,7 @@ object DroidLinkAppIcons {
                 val application = packageManager.getApplicationInfo(packageName, 0)
                 val drawable = packageManager.getApplicationIcon(application)
                 val encoded = encode(drawable)
-                if (encoded.length <= 80_000) {
+                if (encoded.isNotEmpty()) {
                     items.put(
                         JSONObject()
                             .put("package", packageName)
@@ -39,21 +41,24 @@ object DroidLinkAppIcons {
     }
 
     private fun encode(drawable: Drawable): String {
-        val bitmap = Bitmap.createBitmap(ICON_SIZE, ICON_SIZE, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
         val intrinsicWidth = drawable.intrinsicWidth.coerceAtLeast(1)
         val intrinsicHeight = drawable.intrinsicHeight.coerceAtLeast(1)
-        val scale = minOf(ICON_SIZE.toFloat() / intrinsicWidth, ICON_SIZE.toFloat() / intrinsicHeight)
-        val width = (intrinsicWidth * scale).toInt().coerceAtLeast(1)
-        val height = (intrinsicHeight * scale).toInt().coerceAtLeast(1)
-        val left = (ICON_SIZE - width) / 2
-        val top = (ICON_SIZE - height) / 2
-        drawable.bounds = Rect(left, top, left + width, top + height)
-        drawable.draw(canvas)
-        val output = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
-        bitmap.recycle()
-        return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+        for (iconSize in ICON_SIZES) {
+            val bitmap = Bitmap.createBitmap(iconSize, iconSize, Bitmap.Config.ARGB_8888)
+            val scale = minOf(iconSize.toFloat() / intrinsicWidth, iconSize.toFloat() / intrinsicHeight)
+            val width = (intrinsicWidth * scale).toInt().coerceAtLeast(1)
+            val height = (intrinsicHeight * scale).toInt().coerceAtLeast(1)
+            val left = (iconSize - width) / 2
+            val top = (iconSize - height) / 2
+            drawable.bounds = Rect(left, top, left + width, top + height)
+            drawable.draw(Canvas(bitmap))
+            val output = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            bitmap.recycle()
+            val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+            if (encoded.length <= MAX_ENCODED_ICON_CHARS) return encoded
+        }
+        return ""
     }
 
     private fun post(context: Context, token: String, payload: JSONObject) =

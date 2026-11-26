@@ -2,22 +2,38 @@
 
 DroidDesk est une application GTK4/libadwaita pour gérer un téléphone Android depuis GNOME avec ADB, scrcpy et BlueZ.
 
-## Télécharger DroidDesk 0.1.1
+## DroidDesk 0.2.0
 
-La version 0.1.1 est disponible dans les [releases GitHub](https://github.com/simonpatap0n/DroidDesk/releases/tag/v0.1.1), avec l’APK compagnon [DroidLink-0.1.1.apk](https://github.com/simonpatap0n/DroidDesk/releases/download/v0.1.1/DroidLink-0.1.1.apk).
+La version 0.2.0 réunit le compagnon Android DroidLink, un relais auto-hébergé configurable et plusieurs améliorations de contrôle, de fichiers et d’applications. Consulte les [notes de version](release/0.2.0.md) et les [releases GitHub](https://github.com/simonpatap0n/DroidDesk/releases).
+
+### Captures d’écran
+
+Les captures ci-dessous sont des exemples anonymisés, préparés pour illustrer l’application sans exposer les données du téléphone.
+
+| DroidLink | ADB et connexion | Bluetooth |
+| --- | --- | --- |
+| ![DroidLink](release/screenshots/01-droidlink.png) | ![ADB](release/screenshots/02-adb.png) | ![Bluetooth](release/screenshots/03-bluetooth.png) |
+
+| Fichiers | Applications | Galerie |
+| --- | --- | --- |
+| ![Fichiers](release/screenshots/04-files.png) | ![Applications](release/screenshots/05-apps.png) | ![Galerie](release/screenshots/06-gallery.png) |
+
+| Messages | Contacts | Appels |
+| --- | --- | --- |
+| ![Messages](release/screenshots/07-messages.png) | ![Contacts](release/screenshots/08-contacts.png) | ![Appels](release/screenshots/09-calls.png) |
 
 ## Fonctionnalités
 
 - **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC. L’enregistrement automatique optionnel capture la conversation en Opus quand DroidDesk détecte l’appel et relie HFP; les fichiers vont dans `Musique/DroidDesk Calls`.
 - **Contacts** : lecture par DroidLink avec l’autorisation Android Contacts; ADB reste un mode de repli pendant la migration. **Récents** : journal d’appels encore lu via ADB.
 - **SMS** : lire les conversations et l’historique existants depuis la base SMS Android via ADB; préparer une réponse dans l’application Messages du téléphone.
-- **Écran et apps** : afficher scrcpy dans DroidDesk, parcourir les applications avec leurs vraies icônes Android, les ouvrir dans l’écran intégré, afficher leurs réglages ou les désinstaller avec le clic droit.
-- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; ouvrir le stockage USB dans GNOME Files par MTP; afficher les 2 000 photos récentes, remplir le cache de petites vignettes puis améliorer la résolution des photos visibles.
+- **Écran et apps** : contrôler scrcpy incrusté dans DroidDesk et ouvrir au besoin une fenêtre native scrcpy avec le même téléphone, parcourir les applications avec leurs vraies icônes Android, afficher leurs réglages ou les désinstaller.
+- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; monter le stockage dans Nautilus par ADB Wi-Fi avec madbfs/FUSE; afficher les 2 000 photos récentes et supprimer une photo par DroidLink après confirmation Android (Android 11+).
 - **Bluetooth** : choisir un contrôleur (USB ou intégré), activer la radio, rechercher, appairer, connecter, renommer et oublier des appareils.
 - **ADB** : appairage sans fil, connexions TCP/IP, redémarrage/récupération/bootloader, touches système, captures d’écran, logcat, propriétés Android et console `adb shell`.
 - **Infos téléphone** : le fabricant, le modèle, Android, la batterie et le stockage partagé restent visibles dans l’en-tête, avec un bouton d’actualisation.
 - **Notifications** : les alertes Android arrivent comme notifications natives GNOME. Les fermer dans GNOME les ignorera aussi sur le téléphone; DroidDesk garde les 50 dernières alertes et permet d’effacer toute la liste.
-- **DroidLink** : lien Android pour les notifications, la batterie, les photos et les icônes d’applications. DroidLink ne remplace pas l’application Téléphone.
+- **DroidLink** : lien Android pour les notifications, la batterie, les photos, les icônes d’applications et les demandes de suppression confirmées sur le téléphone. Le domaine HTTPS de ton propre relais se configure dans les deux applications. DroidLink ne remplace pas l’application Téléphone.
 - **Icône** : icône SVG originale, installée dans GNOME et conservée dans [`data/io.github.example.DroidDesk.svg`](data/io.github.example.DroidDesk.svg).
 - **Fonctions inspirées de KDE Connect** : batterie Android dans l’en-tête, sonnerie à distance, notifications et réponses rapides, partage de fichiers et de liens, ouverture MTP dans GNOME Files.
 
@@ -27,6 +43,8 @@ La version 0.1.1 est disponible dans les [releases GitHub](https://github.com/si
 sudo apt update
 sudo apt install bluez adb scrcpy ffmpeg gvfs-backends python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 meson ninja-build
 ```
+
+Le montage Nautilus sans fil nécessite également **madbfs** et **FUSE**. Leur nom de paquet dépend de la version de Debian; installe-les depuis les dépôts de ta distribution avant de choisir **Monter dans Nautilus · ADB Wi-Fi**.
 
 BlueZ doit être actif pour gérer le Bluetooth. Au besoin :
 
@@ -44,11 +62,11 @@ sudo systemctl enable --now bluetooth
 
 ### ADB sans fil
 
-Sur Android 11 ou plus récent, active **Options pour les développeurs → Débogage sans fil** et connecte le téléphone au même Wi-Fi que l’ordinateur. Dans la page **ADB** de DroidDesk, appaire-le une seule fois avec **Appairer avec un code…**; l’adresse et le port de l’écran « Associer un appareil » ne servent qu’à cet appairage. Ensuite, DroidDesk découvre le port de connexion changeant avec mDNS : clique **Connecter** dans la liste des appareils appairés, ou **Reconnecter** en haut pour lancer la reconnexion automatiquement. mDNS ne traverse pas le réseau mobile ni les réseaux Wi-Fi isolés.
+Sur Android 11 ou plus récent, active **Options pour les développeurs → Débogage sans fil** et connecte le téléphone au même Wi-Fi que l’ordinateur. Dans la page **ADB** de DroidDesk, appaire-le une seule fois avec **Appairer avec un code…**; l’adresse et le port de l’écran « Associer un appareil » ne servent qu’à cet appairage. Ensuite, DroidDesk découvre le port de connexion changeant avec mDNS : clique **Connecter** dans la liste des appareils appairés, ou **Reconnecter** en haut pour lancer la reconnexion automatiquement. Android 17 et ADB Wi‑Fi 2.0 demandent Android SDK Platform Tools 37 ou plus récent; vérifie aussi que `adb server-status` indique `mdns_enabled: true`. mDNS ne traverse pas le réseau mobile ni les réseaux Wi-Fi isolés.
 
 ## Lancer depuis les sources
 
-Depuis le dossier `android-calls` :
+Depuis la racine du dépôt :
 
 ```sh
 python3 src/droiddesk.py
@@ -56,7 +74,7 @@ python3 src/droiddesk.py
 
 ## Installer dans GNOME
 
-Depuis le dossier `android-calls` :
+Depuis la racine du dépôt :
 
 ```sh
 meson setup build --prefix="$HOME/.local"
@@ -73,7 +91,7 @@ droiddesk
 
 Le projet Android est dans [`droidlink/`](droidlink/README.md). Il fournit une interface Material 3, l’association par code à usage unique, le relais HTTPS de notifications, photos, icônes et commandes. L'appairage DroidLink ne demande ni débogage USB ni options développeur. Les fonctions Android du bureau qui ne sont pas encore migrées vers le compagnon continuent de demander ADB.
 
-Le relais auto-hébergé et son déploiement Docker avec Nginx Proxy Manager sont documentés dans [`droidlink/relay/README.md`](droidlink/relay/README.md). Le domaine configuré dans les clients est `https://droidlink.patapon.lol`; le port privé du conteneur doit être accessible uniquement depuis NPM.
+Le relais auto-hébergé et son déploiement Docker avec Nginx Proxy Manager sont documentés dans [`droidlink/relay/README.md`](droidlink/relay/README.md). Choisis un nom de domaine et configure la même adresse HTTPS dans DroidDesk et DroidLink avant l’association; le port privé du conteneur doit être accessible uniquement depuis NPM.
 
 Pour préparer l’APK, installe Java 17 ou plus récent, **Android SDK Platform 37** et **Android SDK Build-Tools 36.0.0** dans Android Studio (**Settings → Android SDK**), puis lance :
 
@@ -92,9 +110,11 @@ ADB transmet les commandes, pas le son. Pour parler et écouter avec le PC, le t
 
 Après installation de l’APK, ouvre les Réglages rapides Android, touche **Modifier** et ajoute la tuile **DroidLink**. Elle ouvre le compagnon de connexion; Android laisse l’utilisateur choisir la position de cette tuile.
 
-Dans **Écran et apps**, choisir une application ouvre son affichage directement dans DroidDesk. L’application lance le serveur autonome scrcpy en mode flux H.264 brut; FFmpeg le décode vers GTK4. Les clics, glissements, touches clavier et commandes Retour/Accueil/Récents sont envoyés par ADB. L’audio du flux est désactivé; l’audio des appels reste sur le profil Bluetooth mains libres du téléphone. Voir la [documentation officielle du serveur autonome scrcpy](https://github.com/Genymobile/scrcpy/blob/master/doc/develop.md#standalone-server) et sa [documentation sur l’audio](https://github.com/Genymobile/scrcpy/blob/master/doc/audio.md).
+Dans **Écran et apps**, choisir une application l’ouvre sur Android et l’affiche dans la zone intégrée de DroidDesk. **Pop-up scrcpy** ouvre en plus la fenêtre native scrcpy avec le serial ADB actif, y compris l’adresse et le port en Wi‑Fi, et le même binaire ADB que DroidDesk.
 
-Dans **Fichiers**, **Ouvrir dans GNOME · MTP** monte le stockage USB avec GVfs et l’ouvre dans Fichiers. Sur Android, choisis **Transfert de fichiers**. Pour ADB sans fil, utilise le navigateur intégré et les actions de transfert.
+Dans **Fichiers**, **Monter dans Nautilus · ADB Wi-Fi** monte `/sdcard` dans GNOME Files via madbfs et FUSE. La connexion ADB Wi-Fi doit déjà être active. Le montage reste en lecture/écriture selon les droits Android; les dossiers privés des applications demeurent protégés.
+
+Dans **Écran et apps**, la molette envoie le défilement à l’application Android affichée. **Pop-up scrcpy** lance la fenêtre native scrcpy pour le téléphone actuellement connecté.
 
 La page **SMS** lit les messages enregistrés dans `content://sms` via la commande ADB `content query`; les messages et numéros ne sont pas transmis au service DroidLink. DroidDesk conserve localement une copie privée des conversations et des derniers fils consultés pour les réafficher immédiatement au prochain démarrage; les fichiers sont limités à l’utilisateur du compte Linux et restent dans le cache `~/.cache/droiddesk/messages/`. Le bouton de réponse ouvre Messages Android avec le destinataire et le texte préremplis afin que l’application habituelle confirme l’envoi. Android protège les permissions SMS des applications tierces; la lecture directe ici utilise le fournisseur accessible à l’utilisateur `shell` d’ADB.
 
@@ -110,7 +130,7 @@ La liste suivante sert de critères de livraison; les fonctions marquées « à 
 | Appels | Lancement et commandes au moyen du Téléphone Android standard; notifications d’appel dans GNOME; audio par Bluetooth HFP/HSP | État d’appel en temps réel selon le téléphone et le profil Bluetooth |
 | Photos | Galerie des 2 000 plus récentes, vignettes à la demande, aperçu, téléchargement et ouverture externe | Glisser-déposer directement depuis la galerie; l’aperçu permet déjà de glisser le fichier local |
 | Intégration du téléphone | Notifications Android dans GNOME, réponses rapides, batterie, sonnerie à distance, partage de fichiers/liens et montage MTP | Contrôle multimédia, presse-papiers Android et pavé tactile distant |
-| Applications | Lister avec les vraies icônes Android, lancer et contrôler l’écran intégré, désinstaller | Bascule et fenêtres d’applications Android simultanées; dépend de l’appareil |
+| Applications | Lister avec les vraies icônes Android, lancer et contrôler l’écran intégré, ouvrir la fenêtre native scrcpy, désinstaller | Bascule et fenêtres d’applications Android simultanées; dépend de l’appareil |
 
 Android garde le contrôle de l’appel dans son application Téléphone standard. L’accès aux appels entrants dans GNOME exige le relais de notifications DroidLink; les commandes d’appel sont envoyées par ADB. L’autorisation Photos est distincte. L’envoi est préparé dans Messages et doit être confirmé dans l’application Android. Le profil mains libres Bluetooth et les options d’appel varient selon l’appareil et l’opérateur.
 

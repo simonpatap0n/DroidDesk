@@ -1,6 +1,9 @@
 package lol.patapon.droidlink
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -189,6 +192,9 @@ class NotificationRelayService : NotificationListenerService() {
                     "photo_preview" -> command.optLong("photoId", -1L)
                         .takeIf { it > 0L }
                         ?.let { DroidLinkMedia.sendPreview(this, token, it) }
+                    "photo_delete" -> command.optLong("photoId", -1L)
+                        .takeIf { it > 0L }
+                        ?.let { requestPhotoDelete(token, it) }
                     "app_icons" -> DroidLinkAppIcons.sendIcons(
                         this,
                         token,
@@ -199,6 +205,41 @@ class NotificationRelayService : NotificationListenerService() {
         } catch (_: Exception) {
             // The relay may be temporarily unavailable; the next long poll retries.
         }
+    }
+
+    private fun requestPhotoDelete(token: String, photoId: Long) {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            DroidLinkTransport.post(this, token, "events", JSONObject()
+                .put("type", "photo_delete_result")
+                .put("id", photoId)
+                .put("success", false)
+                .put("message", "Autorise les notifications DroidLink dans Android pour afficher la confirmation de suppression."))
+            return
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= 26) {
+            manager.createNotificationChannel(
+                NotificationChannel(PHOTO_DELETE_CHANNEL, "Actions DroidDesk", NotificationManager.IMPORTANCE_HIGH),
+            )
+        }
+        val intent = Intent(this, PhotoDeleteActivity::class.java)
+            .putExtra(PhotoDeleteActivity.EXTRA_PHOTO_ID, photoId)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pending = PendingIntent.getActivity(
+            this,
+            photoId.toInt(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, PHOTO_DELETE_CHANNEL)
+            .setSmallIcon(R.drawable.ic_droidlink_tile)
+            .setContentTitle("Confirmer la suppression")
+            .setContentText("Ouvre la demande pour supprimer la photo sélectionnée.")
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .setCategory(Notification.CATEGORY_RECOMMENDATION)
+            .build()
+        manager.notify(photoId.toInt(), notification)
     }
 
     private fun dismissNotification(token: String, key: String) {
@@ -294,6 +335,7 @@ class NotificationRelayService : NotificationListenerService() {
     companion object {
         private const val PREFERENCES = "droidlink"
         private const val SESSION_TOKEN = "session_token"
+        private const val PHOTO_DELETE_CHANNEL = "photo_delete"
         private const val MAX_DISMISS_ATTEMPTS = 3
         private const val DISMISS_VERIFY_DELAY_MS = 1_200L
         private const val KNOWN_APPS = "known_notification_apps"

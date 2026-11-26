@@ -4,7 +4,7 @@ services:
     container_name: droidlink-relay
     restart: unless-stopped
     ports:
-      - "${DROIDLINK_BIND_ADDRESS:-0.0.0.0}:17892:8080"
+      - "${DROIDLINK_BIND_ADDRESS:-127.0.0.1}:17892:8080"
     volumes:
       - droidlink_relay_data:/data
     security_opt:

@@ -118,6 +118,9 @@ private fun DroidLinkApp() {
     var selectedTab by rememberSaveable { mutableStateOf(DroidLinkTab.Home) }
     var sessionToken by remember { mutableStateOf(readToken(context)) }
     var notificationAccess by remember { mutableStateOf(hasNotificationAccess(context)) }
+    var postNotifications by remember {
+        mutableStateOf(Build.VERSION.SDK_INT < 33 || context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+    }
     var contactsAccess by remember { mutableStateOf(DroidLinkContacts.hasAccess(context)) }
     var pairingCode by rememberSaveable { mutableStateOf("") }
     var pairingStatus by rememberSaveable { mutableStateOf("") }
@@ -131,6 +134,14 @@ private fun DroidLinkApp() {
     ) {
         notificationAccess = hasNotificationAccess(context)
         scope.launch { withContext(Dispatchers.IO) { publishPhoneCapabilities(context) } }
+    }
+    val postNotificationsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> postNotifications = granted }
+    val requestPostNotifications = {
+        if (Build.VERSION.SDK_INT >= 33 && !postNotifications) {
+            postNotificationsLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     val smsRoleLauncher = rememberLauncherForActivityResult(
@@ -258,11 +269,13 @@ private fun DroidLinkApp() {
                 accessGranted = notificationAccess,
                 contactsAccess = contactsAccess,
                 mediaAccess = mediaAccess,
+                postNotifications = postNotifications,
                 defaultSmsApp = defaultSmsApp,
                 smsRoleAvailable = smsRoleAvailable,
                 onEnable = requestNotificationAccess,
                 onDisconnect = disconnect,
                 onRequestMediaAccess = requestMediaAccess,
+                onRequestPostNotifications = requestPostNotifications,
                 onRequestContactsAccess = requestContactsAccess,
                 onRequestSmsRole = requestSmsRole,
             )
@@ -392,10 +405,7 @@ private fun NotificationsScreen(modifier: Modifier, paired: Boolean, accessGrant
     val context = LocalContext.current
     val diagnostics by RelayDiagnostics.state.collectAsState()
     val relayUrl = remember(context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
-            .orEmpty()
-            .trimEnd('/')
+        DroidLinkTransport.relayUrl(context).ifBlank { "Domaine du relais non configuré" }
     }
     LaunchedEffect(context) {
         while (true) {
@@ -490,17 +500,21 @@ private fun SettingsScreen(
     accessGranted: Boolean,
     contactsAccess: Boolean,
     mediaAccess: Boolean,
+    postNotifications: Boolean,
     defaultSmsApp: Boolean,
     smsRoleAvailable: Boolean,
     onEnable: () -> Unit,
     onDisconnect: () -> Unit,
     onRequestContactsAccess: () -> Unit,
     onRequestMediaAccess: () -> Unit,
+    onRequestPostNotifications: () -> Unit,
     onRequestSmsRole: () -> Unit,
 ) {
     val context = LocalContext.current
     var blockedApps by remember { mutableStateOf(readBlockedApps(context)) }
     var knownApps by remember { mutableStateOf(readKnownApps(context)) }
+    var relayDomain by rememberSaveable { mutableStateOf(DroidLinkTransport.relayUrl(context)) }
+    val normalizedRelayDomain = DroidLinkTransport.normalizeRelayUrl(relayDomain)
     var showSmsRoleWarning by rememberSaveable { mutableStateOf(false) }
     if (showSmsRoleWarning) {
         AlertDialog(
@@ -520,6 +534,36 @@ private fun SettingsScreen(
     }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Accès et confidentialité", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        ElevatedCard(shape = RoundedCornerShape(24.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Domaine du relais HTTPS", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = relayDomain,
+                    onValueChange = { relayDomain = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Nom de domaine") },
+                    placeholder = { Text("relay.example.net") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Uri),
+                    supportingText = {
+                        Text(if (paired) "Dissocie DroidLink avant de changer de domaine." else "Utilise le même domaine dans DroidDesk et DroidLink.")
+                    },
+                )
+                Button(
+                    onClick = {
+                        val normalized = normalizedRelayDomain ?: return@Button
+                        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                            .putString(DroidLinkTransport.RELAY_URL_KEY, normalized)
+                            .apply()
+                        relayDomain = normalized
+                    },
+                    enabled = !paired && normalizedRelayDomain != null && normalizedRelayDomain != DroidLinkTransport.relayUrl(context),
+                ) { Text("Enregistrer le domaine") }
+                if (relayDomain.isNotBlank() && normalizedRelayDomain == null) {
+                    Text("Entre un domaine HTTPS valide, sans chemin.", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
         FeatureCard(
             icon = Icons.Outlined.Notifications,
             title = "Accès aux notifications",
@@ -578,6 +622,13 @@ private fun SettingsScreen(
             action = if (mediaAccess) "Autorisé" else "Autoriser",
             onClick = onRequestMediaAccess,
         )
+        if (Build.VERSION.SDK_INT >= 33) FeatureCard(
+            icon = Icons.Outlined.Notifications,
+            title = "Confirmations sur le téléphone",
+            subtitle = if (postNotifications) "Notifications autorisées pour les demandes Android" else "Nécessaire pour confirmer une suppression de photo depuis le PC",
+            action = if (postNotifications) "Autorisé" else "Autoriser",
+            onClick = onRequestPostNotifications,
+        )
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -611,7 +662,7 @@ private fun SettingsScreen(
         ElevatedCard(shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Vos données restent sous votre contrôle", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("DroidLink utilise le relais privé droidlink.patapon.lol. Les contenus des notifications et photos transitent par le serveur auto-hébergé; l’accès aux photos reste soumis à l’autorisation Android.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Les contenus des notifications et photos transitent par le relais HTTPS que vous avez configuré; l’accès aux photos reste soumis à l’autorisation Android.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(2.dp))
                 Text("DroidLink · GPL-3.0-only", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
             }
@@ -686,7 +737,9 @@ private fun isSmsRoleAvailable(context: Context): Boolean =
                 ?.isRoleAvailable(RoleManager.ROLE_SMS) == true)
 
 private suspend fun requestPairing(context: Context, code: String): PairingResult = withContext(Dispatchers.IO) {
-    val connection = (URL("${DroidLinkTransport.DEFAULT_RELAY_URL}/v1/pair").openConnection() as HttpURLConnection)
+    val baseUrl = DroidLinkTransport.relayUrl(context)
+    if (baseUrl.isBlank()) return@withContext PairingResult(error = "Configure le domaine HTTPS du relais dans Accès.")
+    val connection = (URL("$baseUrl/v1/pair").openConnection() as HttpURLConnection)
     try {
         connection.requestMethod = "POST"
         connection.connectTimeout = 3_000
@@ -713,7 +766,7 @@ private suspend fun requestPairing(context: Context, code: String): PairingResul
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(TOKEN_KEY, token)
                 .putString(DroidLinkTransport.SESSION_ID_KEY, sessionId)
-                .putString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
+                .putString(DroidLinkTransport.RELAY_URL_KEY, baseUrl)
                 .apply()
             PairingResult(token = token, sessionId = sessionId)
         } else {
@@ -729,8 +782,9 @@ private suspend fun requestPairing(context: Context, code: String): PairingResul
 
 private suspend fun requestUnpair(context: Context, token: String, sessionId: String) = withContext(Dispatchers.IO) {
     val baseUrl = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        .getString(DroidLinkTransport.RELAY_URL_KEY, DroidLinkTransport.DEFAULT_RELAY_URL)
-        ?.trimEnd('/') ?: DroidLinkTransport.DEFAULT_RELAY_URL
+        .getString(DroidLinkTransport.RELAY_URL_KEY, "")
+        ?.trimEnd('/') ?: ""
+    if (baseUrl.isBlank()) return@withContext
     val connection = (URL("$baseUrl/v1/sessions/$sessionId/unpair").openConnection() as HttpURLConnection)
     try {
         connection.requestMethod = "POST"
