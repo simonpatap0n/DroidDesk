@@ -21,6 +21,7 @@ PORT = 17891
 PAIRING_LIFETIME = 120
 MAX_BODY = 1_048_576
 MAX_CAMERA_FRAME = 512_000
+MAX_AUDIO_CHUNK = 32_000
 RELAY_URL = "https://droidlink.patapon.lol"
 SESSION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "droiddesk" / "droidlink-session.json"
 RELAY_CONFIG_FILE = SESSION_FILE.with_name("droidlink-config.json")
@@ -85,6 +86,10 @@ class DroidLinkBridge:
         self.camera_thread = None
         self.camera_frame_callback = None
         self.camera_sequence = 0
+        self.audio_stop_event = threading.Event()
+        self.audio_thread = None
+        self.audio_chunk_callback = None
+        self.audio_sequence = 0
         self._load_saved_session()
         self.server = None
         self.thread = None
@@ -114,6 +119,7 @@ class DroidLinkBridge:
     def close(self):
         self.stop_event.set()
         self.camera_stop_event.set()
+        self.audio_stop_event.set()
         self.relay_wakeup.set()
         if self.server:
             self.server.shutdown()
@@ -318,6 +324,24 @@ class DroidLinkBridge:
         with self.lock:
             self.camera_frame_callback = None
 
+    def start_audio_receive(self, callback):
+        with self.lock:
+            if not self.paired or not self.session_id or not self.token:
+                return False
+            self.audio_chunk_callback = callback
+            self.audio_stop_event.clear()
+            if self.audio_thread and self.audio_thread.is_alive():
+                return True
+            self.audio_sequence = 0
+            self.audio_thread = threading.Thread(target=self._audio_chunk_loop, daemon=True)
+            self.audio_thread.start()
+        return True
+
+    def stop_audio_receive(self):
+        self.audio_stop_event.set()
+        with self.lock:
+            self.audio_chunk_callback = None
+
     def _camera_frame_loop(self):
         connection = None
         connection_origin = None
@@ -399,6 +423,70 @@ class DroidLinkBridge:
                     connection = None
                     connection_origin = None
                 self.camera_stop_event.wait(0.3)
+        if connection is not None:
+            connection.close()
+
+    def _audio_chunk_loop(self):
+        connection = None
+        connection_origin = None
+        while not self.stop_event.is_set() and not self.audio_stop_event.is_set():
+            with self.lock:
+                session_id, token = self.session_id, self.token
+                relay_url = self.relay_url
+                sequence = self.audio_sequence
+                callback = self.audio_chunk_callback
+                paired = self.paired
+            if not paired or not session_id or not token or not callback:
+                self.audio_stop_event.wait(0.3)
+                continue
+            try:
+                parsed = urlsplit(relay_url)
+                if parsed.scheme not in ("https", "http") or not parsed.hostname:
+                    raise ValueError("Adresse du relais invalide")
+                origin = (parsed.scheme, parsed.hostname, parsed.port)
+                if connection is None or connection_origin != origin:
+                    if connection is not None:
+                        connection.close()
+                    if parsed.scheme == "https":
+                        connection = http.client.HTTPSConnection(
+                            parsed.hostname, parsed.port or 443, timeout=5,
+                            context=ssl.create_default_context(),
+                        )
+                    else:
+                        connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
+                    connection_origin = origin
+                path = f"{parsed.path.rstrip('/')}/v1/sessions/{session_id}/audio/chunk?after={sequence}&wait=1"
+                connection.request(
+                    "GET", path,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/octet-stream", "Connection": "keep-alive"},
+                )
+                response = connection.getresponse()
+                chunk = response.read(MAX_AUDIO_CHUNK + 1)
+                if response.status == 204:
+                    continue
+                if response.status != 200 or not chunk or len(chunk) > MAX_AUDIO_CHUNK or len(chunk) % 2:
+                    self.audio_stop_event.wait(0.1)
+                    continue
+                next_sequence = int(response.getheader("X-Audio-Sequence", "0"))
+                if next_sequence <= sequence:
+                    continue
+                with self.lock:
+                    if self.audio_stop_event.is_set():
+                        break
+                    self.audio_sequence = next_sequence
+                    callback = self.audio_chunk_callback
+                if callback:
+                    try:
+                        callback(chunk)
+                    except Exception:
+                        self.audio_stop_event.set()
+                        break
+            except (http.client.HTTPException, OSError, URLError, TimeoutError, ValueError):
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                    connection_origin = None
+                self.audio_stop_event.wait(0.2)
         if connection is not None:
             connection.close()
 

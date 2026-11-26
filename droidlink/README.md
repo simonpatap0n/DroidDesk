@@ -17,7 +17,7 @@ Le relais conserve les jetons hachés et les informations d'état du téléphone
 - Galerie MediaStore des 2 000 images récentes, avec vignettes et aperçus chargés à la demande.
 - Partage webcam en premier plan : DroidLink demande l'autorisation Caméra, transmet une vidéo JPEG sans audio, et affiche une notification de service avec une action Arrêter.
 - Envoi d'icônes d'applications Android.
-- Accès aux photos, à la caméra et rôle SMS demandés dans Android lorsque l'utilisateur choisit ces fonctions. Aucun accès micro ou audio interne n'est requis par le partage webcam.
+- Accès aux photos, à la caméra, au micro et rôle SMS demandés dans Android lorsque l'utilisateur choisit ces fonctions. Le partage du micro transmet uniquement la voix captée par le micro; il ne capture pas l'audio interne des applications ou des appels.
 
 Le composeur Android habituel reste celui du téléphone. La voix des appels exige le profil Bluetooth mains libres entre le téléphone et le PC. Le relais Internet ne transporte pas l'audio cellulaire. Les fonctions DroidDesk de contacts, journal, SMS, fichiers, contrôle d'écran et commandes d'appel sont encore en migration depuis ADB; l'association DroidLink elle-même ne le requiert plus.
 

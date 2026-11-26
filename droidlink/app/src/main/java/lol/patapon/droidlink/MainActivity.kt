@@ -134,6 +134,11 @@ private fun DroidLinkApp() {
     }
     var cameraRunning by remember { mutableStateOf(DroidLinkCameraService.isRunning(context)) }
     var cameraStatus by rememberSaveable { mutableStateOf("") }
+    var microphoneAccess by remember {
+        mutableStateOf(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+    }
+    var microphoneRunning by remember { mutableStateOf(DroidLinkAudioService.isRunning(context)) }
+    var microphoneStatus by rememberSaveable { mutableStateOf("") }
     var defaultSmsApp by remember { mutableStateOf(isDefaultSmsApp(context)) }
     val smsRoleAvailable = remember { isSmsRoleAvailable(context) }
 
@@ -143,6 +148,11 @@ private fun DroidLinkApp() {
             if (active != cameraRunning) {
                 cameraRunning = active
                 if (!active) cameraStatus = "Le partage de caméra est arrêté."
+            }
+            val microphoneActive = DroidLinkAudioService.isRunning(context)
+            if (microphoneActive != microphoneRunning) {
+                microphoneRunning = microphoneActive
+                if (!microphoneActive) microphoneStatus = "Le partage du micro est arrêté."
             }
             delay(900)
         }
@@ -240,6 +250,39 @@ private fun DroidLinkApp() {
         cameraStatus = "Arrêt du partage de caméra…"
     }
 
+    val microphonePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        microphoneAccess = granted
+        if (granted && sessionToken != null) {
+            runCatching { DroidLinkAudioService.start(context) }
+                .onSuccess {
+                    microphoneRunning = true
+                    microphoneStatus = "Le micro démarre. Garde DroidLink ouvert quelques secondes."
+                }
+                .onFailure { microphoneStatus = "Impossible de démarrer le micro : ${it.message.orEmpty()}" }
+        } else if (!granted) {
+            microphoneStatus = "Autorise l’accès au micro pour transmettre ta voix à DroidDesk."
+        }
+    }
+    val startMicrophoneShare: () -> Unit = {
+        when {
+            sessionToken == null -> microphoneStatus = "Associe d’abord ce téléphone à DroidDesk."
+            !microphoneAccess -> microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            else -> runCatching { DroidLinkAudioService.start(context) }
+                .onSuccess {
+                    microphoneRunning = true
+                    microphoneStatus = "Le micro démarre. Garde DroidLink ouvert quelques secondes."
+                }
+                .onFailure { microphoneStatus = "Impossible de démarrer le micro : ${it.message.orEmpty()}" }
+        }
+    }
+    val stopMicrophoneShare = {
+        DroidLinkAudioService.stop(context)
+        microphoneRunning = false
+        microphoneStatus = "Arrêt du partage du micro…"
+    }
+
     val pairWithDesktop: (String) -> Unit = { code ->
         pairingBusy = true
         pairingStatus = "Connexion à DroidDesk…"
@@ -259,6 +302,8 @@ private fun DroidLinkApp() {
     val disconnect = {
         DroidLinkCameraService.stop(context)
         cameraRunning = false
+        DroidLinkAudioService.stop(context)
+        microphoneRunning = false
         val token = sessionToken
         val sessionId = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(DroidLinkTransport.SESSION_ID_KEY, null)
@@ -325,6 +370,11 @@ private fun DroidLinkApp() {
                 status = cameraStatus,
                 onStart = startCameraShare,
                 onStop = stopCameraShare,
+                microphoneAccess = microphoneAccess,
+                microphoneRunning = microphoneRunning,
+                microphoneStatus = microphoneStatus,
+                onStartMicrophone = startMicrophoneShare,
+                onStopMicrophone = stopMicrophoneShare,
             )
             DroidLinkTab.Settings -> SettingsScreen(
                 modifier = Modifier.padding(padding),
@@ -355,6 +405,11 @@ private fun CameraShareScreen(
     status: String,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    microphoneAccess: Boolean,
+    microphoneRunning: Boolean,
+    microphoneStatus: String,
+    onStartMicrophone: () -> Unit,
+    onStopMicrophone: () -> Unit,
 ) {
     Column(
         modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -362,7 +417,7 @@ private fun CameraShareScreen(
     ) {
         Text("Partage", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
         Text(
-            "Utilise la caméra du téléphone comme webcam dans les applications de GNOME.",
+            "Utilise la caméra et le microphone du téléphone dans les applications du PC.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         ElevatedCard(shape = RoundedCornerShape(28.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
@@ -385,7 +440,7 @@ private fun CameraShareScreen(
                     }
                 }
                 Text(
-                    "DroidLink transmet une vidéo sans son par la connexion HTTPS associée. La caméra reste active seulement pendant ce partage; tu peux l’arrêter ici ou avec la notification système si elle est autorisée.",
+                    "La caméra et le micro sont deux partages distincts. Le micro transmet uniquement la voix captée par le téléphone, jamais l’audio interne des applications ou des appels.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -406,8 +461,43 @@ private fun CameraShareScreen(
                 }
             }
         }
+        ElevatedCard(shape = RoundedCornerShape(28.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+            Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Text("Microphone du téléphone", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    when {
+                        microphoneRunning -> "Transmission active · la voix est envoyée à DroidDesk"
+                        !paired -> "Associe d’abord ce téléphone à DroidDesk"
+                        microphoneAccess -> "Prêt à transmettre la voix au PC"
+                        else -> "Android demandera l’autorisation au premier démarrage"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Garde DroidLink ouvert pendant le partage. Android affichera une notification permanente; tu peux couper le micro ici ou dans cette notification.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (microphoneStatus.isNotBlank()) Text(microphoneStatus, color = MaterialTheme.colorScheme.primary)
+                if (microphoneRunning) {
+                    OutlinedButton(onClick = onStopMicrophone, modifier = Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(18.dp)) {
+                        Text("Arrêter le micro")
+                    }
+                } else {
+                    Button(
+                        onClick = onStartMicrophone,
+                        enabled = paired,
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                        shape = RoundedCornerShape(18.dp),
+                    ) {
+                        Text(if (microphoneAccess) "Démarrer le micro" else "Autoriser et démarrer le micro")
+                    }
+                }
+            }
+        }
         Text(
-            "Sur Debian, active ensuite « Webcam du téléphone » dans Fichiers et sélectionne « DroidDesk Camera » dans Zoom, OBS, Meet ou toute application compatible webcam.",
+            "Sur Debian, active la webcam et le micro du téléphone dans DroidDesk. Dans Firefox ou Discord, choisis l’entrée « DroidLink_Microphone ».",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

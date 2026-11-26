@@ -800,6 +800,14 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.phone_webcam_frames = 0
         self.phone_webcam_generation = 0
         self.phone_webcam_lock = threading.Lock()
+        self.phone_audio_active = False
+        self.phone_audio_sink_name = "droidlink_microphone_sink"
+        self.phone_audio_process = None
+        self.phone_audio_module_id = None
+        self.phone_audio_remap_module_id = None
+        self.phone_audio_chunks = 0
+        self.phone_audio_generation = 0
+        self.phone_audio_lock = threading.Lock()
         self.photo_preview_dir = None
         self.photo_preview_window = None
         self.external_photo_dirs = []
@@ -2322,6 +2330,30 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         camera_group.add(camera_actions)
         page.append(camera_group)
 
+        microphone_group = Adw.PreferencesGroup.new()
+        microphone_group.set_title("Partager le micro du téléphone")
+        microphone_group.set_description(
+            "Crée une entrée audio PipeWire que Firefox et les autres applications peuvent choisir comme microphone."
+        )
+        self.phone_audio_status = Gtk.Label(
+            label="Dans DroidLink → Partage, autorise puis démarre le micro du téléphone.",
+            xalign=0,
+        )
+        self.phone_audio_status.set_wrap(True)
+        self.phone_audio_status.add_css_class("dim-label")
+        microphone_group.add(self.phone_audio_status)
+        microphone_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.phone_audio_start_button = Gtk.Button(label="Activer le micro du téléphone")
+        self.phone_audio_start_button.add_css_class("suggested-action")
+        self.phone_audio_start_button.connect("clicked", self._start_phone_audio)
+        microphone_actions.append(self.phone_audio_start_button)
+        self.phone_audio_stop_button = Gtk.Button(label="Arrêter")
+        self.phone_audio_stop_button.set_sensitive(False)
+        self.phone_audio_stop_button.connect("clicked", self._stop_phone_audio)
+        microphone_actions.append(self.phone_audio_stop_button)
+        microphone_group.add(microphone_actions)
+        page.append(microphone_group)
+
         self.files_note = Gtk.Label(
             label="Nautilus monte /sdcard par ADB Wi-Fi avec madbfs et FUSE. Les dossiers privés des applications restent protégés par Android.",
             xalign=0,
@@ -2372,7 +2404,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 result = subprocess.run(
                     [
                         pkexec, modprobe, "v4l2loopback", "devices=1", "video_nr=42",
-                        "card_label=DroidDesk_Camera", "exclusive_caps=1",
+                        # Keep capture capabilities visible to udev/PipeWire from device creation.
+                        # With exclusive_caps=1, udev may cache this node as output-only before
+                        # FFmpeg starts, so PipeWire clients such as Firefox never enumerate it.
+                        "card_label=DroidDesk_Camera", "exclusive_caps=0",
                     ],
                     capture_output=True,
                     text=True,
@@ -2519,10 +2554,236 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 process.terminate()
             except OSError:
                 pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
         if hasattr(self, "phone_webcam_start_button"):
             self.phone_webcam_start_button.set_sensitive(True)
             self.phone_webcam_stop_button.set_sensitive(False)
             self.phone_webcam_status.set_text("Webcam arrêtée. Le partage Android peut aussi être arrêté dans DroidLink.")
+
+    def _start_phone_audio(self, *_args):
+        bridge = getattr(self, "droidlink_bridge", None)
+        if not bridge or not bridge.snapshot().get("paired"):
+            self.phone_audio_status.set_text("Associe DroidLink à DroidDesk avant d’activer le micro.")
+            return
+        if self.phone_audio_active:
+            return
+        if not shutil.which("pactl") or not shutil.which("pw-cat"):
+            self.phone_audio_status.set_text("PipeWire et sa compatibilité PulseAudio (pactl) sont nécessaires.")
+            return
+        self.phone_audio_active = True
+        self.phone_audio_chunks = 0
+        self.phone_audio_generation += 1
+        generation = self.phone_audio_generation
+        self.phone_audio_start_button.set_sensitive(False)
+        self.phone_audio_stop_button.set_sensitive(True)
+        self.phone_audio_status.set_text(
+            "Création de l’entrée DroidLink_Microphone. Ensuite démarre le micro dans DroidLink sur le téléphone."
+        )
+        threading.Thread(target=self._prepare_phone_audio, args=(generation,), daemon=True).start()
+
+    def _prepare_phone_audio(self, generation):
+        pactl = shutil.which("pactl")
+        pw_cat = shutil.which("pw-cat")
+        if not pactl or not pw_cat:
+            GLib.idle_add(self._phone_audio_failed, generation, "pactl ou pw-cat est introuvable.")
+            return
+        module_id = self._find_phone_audio_module(pactl, "module-null-sink", f"sink_name={self.phone_audio_sink_name}")
+        if not module_id:
+            try:
+                result = subprocess.run(
+                    [
+                        pactl, "load-module", "module-null-sink",
+                        f"sink_name={self.phone_audio_sink_name}",
+                        "rate=16000", "channels=1",
+                        "sink_properties=device.description=DroidLink_Microphone",
+                        "monitor_properties=device.description=DroidLink_Microphone",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                GLib.idle_add(self._phone_audio_failed, generation, str(error))
+                return
+            if result.returncode != 0 or not result.stdout.strip().isdigit():
+                detail = (result.stderr or result.stdout).strip()
+                GLib.idle_add(
+                    self._phone_audio_failed,
+                    generation,
+                    detail or "PipeWire n’a pas créé l’entrée audio virtuelle.",
+                )
+                return
+            module_id = result.stdout.strip()
+        if generation != self.phone_audio_generation or not self.phone_audio_active:
+            subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+            return
+        remap_module_id = self._find_phone_audio_module(
+            pactl,
+            "module-remap-source",
+            "source_name=droidlink_phone_microphone",
+        )
+        if not remap_module_id:
+            try:
+                remap_result = subprocess.run(
+                    [
+                        pactl, "load-module", "module-remap-source",
+                        f"master={self.phone_audio_sink_name}.monitor",
+                        "source_name=droidlink_phone_microphone",
+                        "source_properties=device.description=DroidLink_Microphone",
+                        "format=s16le", "rate=16000", "channels=1",
+                        "master_channel_map=mono", "channel_map=mono",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+                GLib.idle_add(self._phone_audio_failed, generation, str(error))
+                return
+            if remap_result.returncode != 0 or not remap_result.stdout.strip().isdigit():
+                detail = (remap_result.stderr or remap_result.stdout).strip()
+                subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+                GLib.idle_add(
+                    self._phone_audio_failed,
+                    generation,
+                    detail or "PipeWire n’a pas créé l’entrée de micro compatible avec Discord.",
+                )
+                return
+            remap_module_id = remap_result.stdout.strip()
+        if generation != self.phone_audio_generation or not self.phone_audio_active:
+            subprocess.run([pactl, "unload-module", remap_module_id], capture_output=True, check=False)
+            subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+            return
+        try:
+            process = subprocess.Popen(
+                [
+                    pw_cat, "--playback", "--raw", "--target", self.phone_audio_sink_name,
+                    "--rate", "16000", "--channels", "1", "--format", "s16", "--latency", "40ms", "-",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except OSError as error:
+            subprocess.run([pactl, "unload-module", remap_module_id], capture_output=True, check=False)
+            subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+            GLib.idle_add(self._phone_audio_failed, generation, str(error))
+            return
+        with self.phone_audio_lock:
+            self.phone_audio_module_id = module_id
+            self.phone_audio_remap_module_id = remap_module_id
+            self.phone_audio_process = process
+        if generation != self.phone_audio_generation or not self.phone_audio_active:
+            self._stop_phone_audio(send_remote=False)
+            return
+        bridge = getattr(self, "droidlink_bridge", None)
+        if not bridge or not bridge.start_audio_receive(self._phone_audio_received):
+            GLib.idle_add(self._phone_audio_failed, generation, "La connexion DroidLink n’est plus associée.")
+            return
+        GLib.idle_add(
+            self._set_phone_audio_status,
+            generation,
+            "Entrée DroidLink_Microphone prête pour Firefox, Discord et les autres applications. Démarre le micro dans DroidLink.",
+        )
+
+    @staticmethod
+    def _find_phone_audio_module(pactl, module_name, argument_marker):
+        try:
+            result = subprocess.run(
+                [pactl, "list", "short", "modules"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            fields = line.split("\t", 2)
+            if len(fields) == 3 and fields[1] == module_name and argument_marker in fields[2]:
+                return fields[0]
+        return None
+
+    def _set_phone_audio_status(self, generation, message):
+        if generation == self.phone_audio_generation and self.phone_audio_active:
+            self.phone_audio_status.set_text(message)
+        return GLib.SOURCE_REMOVE
+
+    def _phone_audio_received(self, pcm):
+        try:
+            with self.phone_audio_lock:
+                if not self.phone_audio_active:
+                    return
+                process = self.phone_audio_process
+                if process and process.poll() is not None:
+                    self.phone_audio_process = None
+                    process = None
+                if process is None or process.stdin is None:
+                    raise RuntimeError("PipeWire a fermé l’entrée audio virtuelle.")
+                process.stdin.write(pcm)
+                self.phone_audio_chunks += 1
+                first_chunk = self.phone_audio_chunks == 1
+            if first_chunk:
+                GLib.idle_add(
+                    self._set_phone_audio_status,
+                    self.phone_audio_generation,
+                    "Micro actif · DroidLink_Microphone est disponible dans Firefox, Discord et les autres applications.",
+                )
+        except (BrokenPipeError, OSError, RuntimeError) as error:
+            GLib.idle_add(self._phone_audio_failed, self.phone_audio_generation, str(error))
+
+    def _phone_audio_failed(self, generation, message):
+        if generation != self.phone_audio_generation:
+            return GLib.SOURCE_REMOVE
+        self._stop_phone_audio(send_remote=False)
+        if hasattr(self, "phone_audio_status"):
+            self.phone_audio_status.set_text(f"Micro indisponible · {message}")
+        self._set_status(f"Micro du téléphone impossible : {message}", True)
+        return GLib.SOURCE_REMOVE
+
+    def _stop_phone_audio(self, *_args, send_remote=True):
+        self.phone_audio_active = False
+        self.phone_audio_generation += 1
+        bridge = getattr(self, "droidlink_bridge", None)
+        if bridge:
+            bridge.stop_audio_receive()
+            if send_remote and bridge.snapshot().get("paired"):
+                bridge.enqueue_command("audio_stop", "")
+        with self.phone_audio_lock:
+            process = self.phone_audio_process
+            module_id = self.phone_audio_module_id
+            remap_module_id = self.phone_audio_remap_module_id
+            self.phone_audio_process = None
+            self.phone_audio_module_id = None
+            self.phone_audio_remap_module_id = None
+        if process:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+        pactl = shutil.which("pactl")
+        if pactl and remap_module_id:
+            subprocess.run([pactl, "unload-module", remap_module_id], capture_output=True, check=False)
+        if pactl and module_id:
+            subprocess.run([pactl, "unload-module", module_id], capture_output=True, check=False)
+        if hasattr(self, "phone_audio_start_button"):
+            self.phone_audio_start_button.set_sensitive(True)
+            self.phone_audio_stop_button.set_sensitive(False)
+            self.phone_audio_status.set_text("Micro arrêté. Choisis DroidLink_Microphone comme entrée dans Firefox ou Discord pendant le partage.")
 
     def update_bluetooth_view(self):
         if not hasattr(self, "bluez"):
@@ -3192,6 +3453,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _on_close(self, *_args):
         self._stop_phone_webcam(send_remote=False)
+        self._stop_phone_audio(send_remote=False)
         if getattr(self, "gallery_prefetch_timer", 0):
             GLib.source_remove(self.gallery_prefetch_timer)
             self.gallery_prefetch_timer = 0

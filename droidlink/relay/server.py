@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlsplit
 
 MAX_BODY = 1_048_576
 MAX_CAMERA_FRAME = 512_000
+MAX_AUDIO_CHUNK = 32_000
+MAX_AUDIO_QUEUE = 30
 MAX_QUEUE = 100
 PAIR_TTL = 120
 PAIR_ATTEMPTS = 8
@@ -40,6 +42,8 @@ class Relay:
         self.events = defaultdict(lambda: deque(maxlen=MAX_QUEUE))
         self.commands = defaultdict(lambda: deque(maxlen=MAX_QUEUE))
         self.camera_frames = {}
+        self.audio_chunks = defaultdict(lambda: deque(maxlen=MAX_AUDIO_QUEUE))
+        self.audio_sequences = defaultdict(int)
         self.failed_pair_attempts = deque()
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -103,6 +107,8 @@ class Relay:
             self.events.pop(session_id, None)
             self.commands.pop(session_id, None)
             self.camera_frames.pop(session_id, None)
+            self.audio_chunks.pop(session_id, None)
+            self.audio_sequences.pop(session_id, None)
             self.changed.notify_all()
         return 201, {"registered": True, "expiresIn": PAIR_TTL}
 
@@ -245,6 +251,40 @@ class Relay:
                     return None
                 self.changed.wait(remaining)
 
+    def add_audio_chunk(self, session_id, pcm):
+        if not isinstance(pcm, bytes) or not 2 <= len(pcm) <= MAX_AUDIO_CHUNK or len(pcm) % 2:
+            return False
+        with self.changed:
+            if self._session(session_id) is None:
+                return False
+            chunks = self.audio_chunks[session_id]
+            self.audio_sequences[session_id] += 1
+            sequence = self.audio_sequences[session_id]
+            chunks.append((sequence, pcm, time.monotonic()))
+            now = time.time()
+            row = self._session(session_id)
+            if now - float(row["last_seen_at"] or 0) > 10:
+                self.db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (now, session_id))
+                self.db.commit()
+            self.changed.notify_all()
+        return True
+
+    def wait_audio_chunk(self, session_id, after, timeout):
+        deadline = time.monotonic() + max(0, min(2, timeout))
+        with self.changed:
+            while True:
+                chunks = self.audio_chunks[session_id]
+                now = time.monotonic()
+                while chunks and now - chunks[0][2] > 5:
+                    chunks.popleft()
+                for chunk in chunks:
+                    if chunk[0] > after:
+                        return chunk
+                remaining = deadline - now
+                if remaining <= 0:
+                    return None
+                self.changed.wait(remaining)
+
     def add_command(self, session_id, payload):
         if not isinstance(payload, dict):
             return False
@@ -289,6 +329,8 @@ class Relay:
             self.events.pop(session_id, None)
             self.commands.pop(session_id, None)
             self.camera_frames.pop(session_id, None)
+            self.audio_chunks.pop(session_id, None)
+            self.audio_sequences.pop(session_id, None)
             for code, pairing in list(self.pair_codes.items()):
                 if pairing["session_id"] == session_id:
                     del self.pair_codes[code]
@@ -333,6 +375,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+        elif action == "audio_chunk" and self._authorized(session_id, "desktop"):
+            after = self._bounded_query_int(parsed.query, "after", 0, 2**63 - 1)
+            wait = min(2, self._wait_seconds(parsed.query))
+            chunk = self.server.relay.wait_audio_chunk(session_id, after, wait)
+            if chunk:
+                self._respond_audio_chunk(chunk)
+            else:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
         else:
             self._respond(401, {"error": "Session DroidLink invalide."})
 
@@ -372,6 +425,17 @@ class Handler(BaseHTTPRequestHandler):
             jpeg = self._read_bytes(MAX_CAMERA_FRAME)
             rotation = self._bounded_header_int(self.headers.get("X-Frame-Rotation", "0"), 0, 270)
             accepted = relay.add_camera_frame(session_id, jpeg, rotation) if jpeg is not None else False
+            self._respond(202 if accepted else 400, {"accepted": accepted})
+            return
+        if action == "audio_chunk":
+            if not self._authorized(session_id, "phone"):
+                self._respond(401, {"error": "Session DroidLink invalide."})
+                return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/octet-stream":
+                self._respond(415, {"error": "Le microphone doit envoyer du PCM brut."})
+                return
+            pcm = self._read_bytes(MAX_AUDIO_CHUNK)
+            accepted = relay.add_audio_chunk(session_id, pcm) if pcm is not None else False
             self._respond(202 if accepted else 400, {"accepted": accepted})
             return
 
@@ -428,10 +492,10 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _route(path):
-        match = re.fullmatch(r"/v1/sessions/([A-Za-z0-9_-]{20,64})/(events|commands|status|phone|unpair|camera/frame)", path)
+        match = re.fullmatch(r"/v1/sessions/([A-Za-z0-9_-]{20,64})/(events|commands|status|phone|unpair|camera/frame|audio/chunk)", path)
         if not match:
             return None, None
-        action = "camera_frame" if match.group(2) == "camera/frame" else match.group(2)
+        action = match.group(2).replace("/", "_")
         return match.group(1), action
 
     @staticmethod
@@ -469,6 +533,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(jpeg)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _respond_audio_chunk(self, chunk):
+        sequence, pcm, _created = chunk
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(pcm)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Audio-Sequence", str(sequence))
+        self.send_header("X-Audio-Sample-Rate", "16000")
+        self.send_header("X-Audio-Channels", "1")
+        self.send_header("X-Audio-Format", "s16le")
+        self.end_headers()
+        try:
+            self.wfile.write(pcm)
         except (BrokenPipeError, ConnectionResetError):
             pass
 

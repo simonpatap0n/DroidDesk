@@ -116,6 +116,36 @@ internal object DroidLinkTransport {
         }
     }
 
+    fun postAudioChunk(context: Context, token: String, pcm: ByteArray): Int {
+        val endpoint = sessionUrl(context, "audio/chunk") ?: return 0
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        return try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 3_000
+            connection.readTimeout = 3_000
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(pcm.size)
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            connection.setRequestProperty("Content-Type", "application/octet-stream")
+            connection.setRequestProperty("X-Audio-Sample-Rate", "16000")
+            connection.setRequestProperty("X-Audio-Channels", "1")
+            connection.setRequestProperty("X-Audio-Format", "s16le")
+            connection.outputStream.use { it.write(pcm) }
+            val responseCode = connection.responseCode
+            val response = if (responseCode in 200..399) connection.inputStream else connection.errorStream
+            response?.use { stream ->
+                val buffer = ByteArray(256)
+                var count = stream.read(buffer)
+                while (count != -1) count = stream.read(buffer)
+            }
+            responseCode
+        } catch (_: Exception) {
+            0
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     fun getCommands(context: Context, token: String): JSONArray? {
         val endpoint = sessionUrl(context, "commands")?.let { "$it?wait=18" } ?: return null
         val connection = URL(endpoint).openConnection() as HttpURLConnection
