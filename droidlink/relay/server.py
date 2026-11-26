@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 
 MAX_BODY = 1_048_576
+MAX_CAMERA_FRAME = 512_000
 MAX_QUEUE = 100
 PAIR_TTL = 120
 PAIR_ATTEMPTS = 8
@@ -38,6 +39,7 @@ class Relay:
         self.pair_codes = {}
         self.events = defaultdict(lambda: deque(maxlen=MAX_QUEUE))
         self.commands = defaultdict(lambda: deque(maxlen=MAX_QUEUE))
+        self.camera_frames = {}
         self.failed_pair_attempts = deque()
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -100,6 +102,7 @@ class Relay:
             self.pair_codes[code] = {"session_id": session_id, "expires": now + PAIR_TTL, "attempts": 0}
             self.events.pop(session_id, None)
             self.commands.pop(session_id, None)
+            self.camera_frames.pop(session_id, None)
             self.changed.notify_all()
         return 201, {"registered": True, "expiresIn": PAIR_TTL}
 
@@ -206,6 +209,42 @@ class Relay:
             self.changed.notify_all()
         return True
 
+    def add_camera_frame(self, session_id, jpeg, rotation):
+        if not isinstance(jpeg, bytes) or not 4 <= len(jpeg) <= MAX_CAMERA_FRAME:
+            return False
+        if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+            return False
+        with self.changed:
+            row = self._session(session_id)
+            if row is None:
+                return False
+            previous = self.camera_frames.get(session_id)
+            sequence = (previous[0] + 1) if previous else 1
+            self.camera_frames[session_id] = (
+                sequence,
+                jpeg,
+                max(0, min(270, int(rotation))),
+                time.monotonic(),
+            )
+            now = time.time()
+            if now - float(row["last_seen_at"] or 0) > 10:
+                self.db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (now, session_id))
+                self.db.commit()
+            self.changed.notify_all()
+        return True
+
+    def wait_camera_frame(self, session_id, after, timeout):
+        deadline = time.monotonic() + max(0, min(8, timeout))
+        with self.changed:
+            while True:
+                frame = self.camera_frames.get(session_id)
+                if frame and frame[0] > after and time.monotonic() - frame[3] <= 3:
+                    return frame
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.changed.wait(remaining)
+
     def add_command(self, session_id, payload):
         if not isinstance(payload, dict):
             return False
@@ -249,6 +288,7 @@ class Relay:
             self.db.commit()
             self.events.pop(session_id, None)
             self.commands.pop(session_id, None)
+            self.camera_frames.pop(session_id, None)
             for code, pairing in list(self.pair_codes.items()):
                 if pairing["session_id"] == session_id:
                     del self.pair_codes[code]
@@ -257,6 +297,7 @@ class Relay:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "DroidLinkRelay/1"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, _fmt, *_args):
         return
@@ -281,6 +322,17 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "commands" and self._authorized(session_id, "phone"):
             wait = self._wait_seconds(parsed.query)
             self._respond(200, self.server.relay.poll(session_id, "commands", wait))
+        elif action == "camera_frame" and self._authorized(session_id, "desktop"):
+            after = self._bounded_query_int(parsed.query, "after", 0, 2**63 - 1)
+            wait = min(8, self._wait_seconds(parsed.query))
+            frame = self.server.relay.wait_camera_frame(session_id, after, wait)
+            if frame:
+                self._respond_camera_frame(frame)
+            else:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
         else:
             self._respond(401, {"error": "Session DroidLink invalide."})
 
@@ -289,15 +341,19 @@ class Handler(BaseHTTPRequestHandler):
         if self._requires_https() and self.headers.get("X-Forwarded-Proto", "").lower() != "https":
             self._respond(426, {"error": "Utilise la connexion HTTPS publique."})
             return
-        payload = self._read_json()
-        if payload is None:
-            self._respond(400, {"error": "Requête JSON invalide."})
-            return
         if parsed.path == "/v1/sessions":
+            payload = self._read_json()
+            if payload is None:
+                self._respond(400, {"error": "Requête JSON invalide."})
+                return
             status, response = self.server.relay.create_session(payload)
             self._respond(status, response)
             return
         if parsed.path == "/v1/pair":
+            payload = self._read_json()
+            if payload is None:
+                self._respond(400, {"error": "Requête JSON invalide."})
+                return
             status, response = self.server.relay.pair(payload)
             self._respond(status, response)
             return
@@ -306,6 +362,23 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "Route inconnue."})
             return
         relay = self.server.relay
+        if action == "camera_frame":
+            if not self._authorized(session_id, "phone"):
+                self._respond(401, {"error": "Session DroidLink invalide."})
+                return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "image/jpeg":
+                self._respond(415, {"error": "La caméra doit envoyer une image JPEG."})
+                return
+            jpeg = self._read_bytes(MAX_CAMERA_FRAME)
+            rotation = self._bounded_header_int(self.headers.get("X-Frame-Rotation", "0"), 0, 270)
+            accepted = relay.add_camera_frame(session_id, jpeg, rotation) if jpeg is not None else False
+            self._respond(202 if accepted else 400, {"accepted": accepted})
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            self._respond(400, {"error": "Requête JSON invalide."})
+            return
         if action == "events" and self._authorized(session_id, "phone"):
             accepted = relay.add_event(session_id, payload)
             self._respond(202 if accepted else 404, {"accepted": accepted})
@@ -333,6 +406,16 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return None
 
+    def _read_bytes(self, maximum):
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size < 4 or size > maximum:
+                return None
+            body = self.rfile.read(size)
+            return body if len(body) == size else None
+        except (ValueError, OSError):
+            return None
+
     def _authorized(self, session_id, role):
         authorization = self.headers.get("Authorization", "")
         if not authorization.startswith("Bearer "):
@@ -345,8 +428,11 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _route(path):
-        match = re.fullmatch(r"/v1/sessions/([A-Za-z0-9_-]{20,64})/(events|commands|status|phone|unpair)", path)
-        return (match.group(1), match.group(2)) if match else (None, None)
+        match = re.fullmatch(r"/v1/sessions/([A-Za-z0-9_-]{20,64})/(events|commands|status|phone|unpair|camera/frame)", path)
+        if not match:
+            return None, None
+        action = "camera_frame" if match.group(2) == "camera/frame" else match.group(2)
+        return match.group(1), action
 
     @staticmethod
     def _wait_seconds(query):
@@ -354,6 +440,37 @@ class Handler(BaseHTTPRequestHandler):
             return max(0, min(25, int(parse_qs(query).get("wait", ["20"])[0])))
         except (TypeError, ValueError):
             return 20
+
+    @staticmethod
+    def _bounded_query_int(query, key, minimum, maximum):
+        try:
+            value = int(parse_qs(query).get(key, [str(minimum)])[0])
+            return max(minimum, min(maximum, value))
+        except (TypeError, ValueError):
+            return minimum
+
+    @staticmethod
+    def _bounded_header_int(value, minimum, maximum):
+        try:
+            number = int(value)
+            return number if number in (0, 90, 180, 270) else minimum
+        except (TypeError, ValueError):
+            return minimum
+
+    def _respond_camera_frame(self, frame):
+        sequence, jpeg, rotation, _created = frame
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(jpeg)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Sequence", str(sequence))
+        self.send_header("X-Frame-Rotation", str(rotation))
+        self.end_headers()
+        try:
+            self.wfile.write(jpeg)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _respond(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

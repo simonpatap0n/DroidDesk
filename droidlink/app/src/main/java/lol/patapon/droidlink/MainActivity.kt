@@ -3,6 +3,7 @@ package lol.patapon.droidlink
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.app.role.RoleManager
 import android.os.BatteryManager
 import android.os.Build
@@ -34,6 +35,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.BatteryFull
+import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Notifications
@@ -104,6 +106,7 @@ class MainActivity : ComponentActivity() {
 
 private enum class DroidLinkTab(val label: String, val icon: ImageVector) {
     Home("Accueil", Icons.Outlined.Home),
+    Sharing("Partage", Icons.Outlined.CameraAlt),
     Notifications("Alertes", Icons.Outlined.Notifications),
     Settings("Accès", Icons.Outlined.Settings),
 }
@@ -126,8 +129,24 @@ private fun DroidLinkApp() {
     var pairingStatus by rememberSaveable { mutableStateOf("") }
     var pairingBusy by remember { mutableStateOf(false) }
     var mediaAccess by remember { mutableStateOf(DroidLinkMedia.hasAccess(context)) }
+    var cameraAccess by remember {
+        mutableStateOf(context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
+    var cameraRunning by remember { mutableStateOf(DroidLinkCameraService.isRunning(context)) }
+    var cameraStatus by rememberSaveable { mutableStateOf("") }
     var defaultSmsApp by remember { mutableStateOf(isDefaultSmsApp(context)) }
     val smsRoleAvailable = remember { isSmsRoleAvailable(context) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            val active = DroidLinkCameraService.isRunning(context)
+            if (active != cameraRunning) {
+                cameraRunning = active
+                if (!active) cameraStatus = "Le partage de caméra est arrêté."
+            }
+            delay(900)
+        }
+    }
 
     val settingsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -188,6 +207,39 @@ private fun DroidLinkApp() {
         if (!DroidLinkMedia.hasAccess(context)) mediaPermissionLauncher.launch(permission)
     }
 
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        cameraAccess = granted
+        if (granted && sessionToken != null) {
+            runCatching { DroidLinkCameraService.start(context) }
+                .onSuccess {
+                    cameraRunning = true
+                    cameraStatus = "La caméra démarre. Garde DroidLink ouvert quelques secondes."
+                }
+                .onFailure { cameraStatus = "Impossible de démarrer la caméra : ${it.message.orEmpty()}" }
+        } else if (!granted) {
+            cameraStatus = "Autorise l’accès à la caméra pour partager l’image avec DroidDesk."
+        }
+    }
+    val startCameraShare: () -> Unit = {
+        when {
+            sessionToken == null -> cameraStatus = "Associe DroidLink à DroidDesk avant de partager la caméra."
+            !cameraAccess -> cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            else -> runCatching { DroidLinkCameraService.start(context) }
+                .onSuccess {
+                    cameraRunning = true
+                    cameraStatus = "La caméra démarre. Garde DroidLink ouvert quelques secondes."
+                }
+                .onFailure { cameraStatus = "Impossible de démarrer la caméra : ${it.message.orEmpty()}" }
+        }
+    }
+    val stopCameraShare = {
+        DroidLinkCameraService.stop(context)
+        cameraRunning = false
+        cameraStatus = "Arrêt du partage de caméra…"
+    }
+
     val pairWithDesktop: (String) -> Unit = { code ->
         pairingBusy = true
         pairingStatus = "Connexion à DroidDesk…"
@@ -205,6 +257,8 @@ private fun DroidLinkApp() {
     }
 
     val disconnect = {
+        DroidLinkCameraService.stop(context)
+        cameraRunning = false
         val token = sessionToken
         val sessionId = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(DroidLinkTransport.SESSION_ID_KEY, null)
@@ -263,6 +317,15 @@ private fun DroidLinkApp() {
                 accessGranted = notificationAccess,
                 onEnable = requestNotificationAccess,
             )
+            DroidLinkTab.Sharing -> CameraShareScreen(
+                modifier = Modifier.padding(padding),
+                paired = sessionToken != null,
+                cameraAccess = cameraAccess,
+                cameraRunning = cameraRunning,
+                status = cameraStatus,
+                onStart = startCameraShare,
+                onStop = stopCameraShare,
+            )
             DroidLinkTab.Settings -> SettingsScreen(
                 modifier = Modifier.padding(padding),
                 paired = sessionToken != null,
@@ -280,6 +343,74 @@ private fun DroidLinkApp() {
                 onRequestSmsRole = requestSmsRole,
             )
         }
+    }
+}
+
+@Composable
+private fun CameraShareScreen(
+    modifier: Modifier,
+    paired: Boolean,
+    cameraAccess: Boolean,
+    cameraRunning: Boolean,
+    status: String,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    Column(
+        modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text("Partage", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Text(
+            "Utilise la caméra du téléphone comme webcam dans les applications de GNOME.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ElevatedCard(shape = RoundedCornerShape(28.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+            Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.CameraAlt, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(30.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Caméra du téléphone", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            when {
+                                cameraRunning -> "Transmission active · touche Arrêter pour couper la caméra"
+                                !paired -> "Associe d’abord ce téléphone à DroidDesk"
+                                cameraAccess -> "Prête à être partagée avec le PC"
+                                else -> "Android demandera l’autorisation au premier démarrage"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Text(
+                    "DroidLink transmet une vidéo sans son par la connexion HTTPS associée. La caméra reste active seulement pendant ce partage; tu peux l’arrêter ici ou avec la notification système si elle est autorisée.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary)
+                if (cameraRunning) {
+                    OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(18.dp)) {
+                        Text("Arrêter le partage")
+                    }
+                } else {
+                    Button(
+                        onClick = onStart,
+                        enabled = paired,
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                        shape = RoundedCornerShape(18.dp),
+                    ) {
+                        Text(if (cameraAccess) "Démarrer le partage" else "Autoriser et démarrer")
+                    }
+                }
+            }
+        }
+        Text(
+            "Sur Debian, active ensuite « Webcam du téléphone » dans Fichiers et sélectionne « DroidDesk Camera » dans Zoom, OBS, Meet ou toute application compatible webcam.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

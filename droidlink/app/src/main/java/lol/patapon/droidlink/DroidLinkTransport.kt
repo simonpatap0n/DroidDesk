@@ -87,6 +87,35 @@ internal object DroidLinkTransport {
         }
     }
 
+    fun postCameraFrame(context: Context, token: String, jpeg: ByteArray, rotation: Int): Int {
+        val endpoint = sessionUrl(context, "camera/frame") ?: return 0
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        return try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 4_000
+            connection.readTimeout = 8_000
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(jpeg.size)
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            connection.setRequestProperty("Content-Type", "image/jpeg")
+            connection.setRequestProperty("X-Frame-Rotation", rotation.toString())
+            connection.setRequestProperty("Connection", "keep-alive")
+            connection.outputStream.use { it.write(jpeg) }
+            val responseCode = connection.responseCode
+            val response = if (responseCode in 200..399) connection.inputStream else connection.errorStream
+            response?.use { stream ->
+                val buffer = ByteArray(1024)
+                var count = stream.read(buffer)
+                while (count != -1) count = stream.read(buffer)
+            }
+            responseCode
+        } catch (_: Exception) {
+            0
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     fun getCommands(context: Context, token: String): JSONArray? {
         val endpoint = sessionUrl(context, "commands")?.let { "$it?wait=18" } ?: return null
         val connection = URL(endpoint).openConnection() as HttpURLConnection

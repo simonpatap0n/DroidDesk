@@ -1,4 +1,4 @@
-project('droiddesk', version: '0.2.0', meson_version: '>=0.60.0')
+project('droiddesk', version: '0.2.1', meson_version: '>=0.60.0')
 
 app_id = 'io.github.example.DroidDesk'
 

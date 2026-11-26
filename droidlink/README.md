@@ -1,6 +1,6 @@
 # DroidLink
 
-DroidLink est le compagnon Android de DroidDesk. Il relaie les notifications, les commandes, la batterie, les photos récentes et les icônes d'applications à travers un relais HTTPS auto-hébergé. Le téléphone et le PC ouvrent chacun une connexion sortante; ils peuvent se trouver sur des réseaux différents.
+DroidLink est le compagnon Android de DroidDesk. Il relaie les notifications, les commandes, la batterie, les photos récentes, les icônes d'applications et le flux webcam à travers un relais HTTPS auto-hébergé. Le téléphone et le PC ouvrent chacun une connexion sortante; ils peuvent se trouver sur des réseaux différents.
 
 ## Relais auto-hébergé
 
@@ -15,10 +15,15 @@ Le relais conserve les jetons hachés et les informations d'état du téléphone
 - Synchronisation de la batterie et sonnerie distante.
 - Lecture des contacts après autorisation Android.
 - Galerie MediaStore des 2 000 images récentes, avec vignettes et aperçus chargés à la demande.
+- Partage webcam en premier plan : DroidLink demande l'autorisation Caméra, transmet une vidéo JPEG sans audio, et affiche une notification de service avec une action Arrêter.
 - Envoi d'icônes d'applications Android.
-- Accès photos et rôle SMS demandés dans Android lorsque l'utilisateur choisit ces fonctions.
+- Accès aux photos, à la caméra et rôle SMS demandés dans Android lorsque l'utilisateur choisit ces fonctions. Aucun accès micro ou audio interne n'est requis par le partage webcam.
 
 Le composeur Android habituel reste celui du téléphone. La voix des appels exige le profil Bluetooth mains libres entre le téléphone et le PC. Le relais Internet ne transporte pas l'audio cellulaire. Les fonctions DroidDesk de contacts, journal, SMS, fichiers, contrôle d'écran et commandes d'appel sont encore en migration depuis ADB; l'association DroidLink elle-même ne le requiert plus.
+
+Pour la webcam, ouvre **Partage** dans DroidLink, associe le téléphone si nécessaire, puis touche **Démarrer le partage**. Android demande la permission Caméra et garde un indicateur de service pendant le flux. Sur le PC, active **Webcam du téléphone** dans DroidDesk → **Fichiers**. La vidéo passe par le relais HTTPS; elle n'est pas enregistrée par le relais, mais son administrateur peut la voir en transit. Arrête le partage dans DroidLink ou depuis sa notification.
+
+La permission Android `RECORD_AUDIO` ne donne pas à une application ordinaire l'accès aux deux côtés d'un appel cellulaire. `CAPTURE_AUDIO_OUTPUT` est réservée aux composants système; Android décrit aussi des cas spécifiques pour un service d'accessibilité autorisé, mais DroidLink n'implémente pas cette voie. Devenir le composeur par défaut donne accès à la gestion et à l'interface des appels, pas à un flux PCM de l'appel. Un enregistreur séparé comme Talker ACR ne peut pas être réutilisé comme bibliothèque sans interface d'intégration fournie par son éditeur. DroidLink garde donc le composeur du téléphone et l'audio HFP. La webcam ne demande pas ces permissions audio.
 
 ## Compiler
 
@@ -37,6 +42,6 @@ Le Wrapper téléchargera automatiquement Gradle 9.6.0 et les dépendances Gradl
 3. Avant l’association, configure le même domaine HTTPS dans **Configuration** sur DroidDesk et **Accès → Domaine du relais HTTPS** sur Android.
 4. Dans DroidDesk, ouvre **DroidLink → Démarrer l'appairage**.
 5. Entre le code affiché dans DroidLink.
-6. Autorise l'accès aux notifications dans les réglages Android; autorise les photos si tu veux la galerie.
+6. Autorise les notifications; donne l’accès aux photos et à la caméra seulement lorsque tu actives ces fonctions.
 
 DroidLink est distribué sous GNU GPL-3.0-only.

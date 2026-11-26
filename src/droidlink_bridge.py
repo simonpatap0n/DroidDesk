@@ -1,10 +1,12 @@
 """GNOME-side client for the self-hosted DroidLink HTTPS relay."""
 
 import hashlib
+import http.client
 import json
 import os
 import re
 import secrets
+import ssl
 import tempfile
 import threading
 import time
@@ -18,6 +20,8 @@ from urllib.request import Request, urlopen
 PORT = 17891
 PAIRING_LIFETIME = 120
 MAX_BODY = 1_048_576
+MAX_CAMERA_FRAME = 512_000
+RELAY_URL = "https://droidlink.patapon.lol"
 SESSION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "droiddesk" / "droidlink-session.json"
 RELAY_CONFIG_FILE = SESSION_FILE.with_name("droidlink-config.json")
 
@@ -77,6 +81,10 @@ class DroidLinkBridge:
         self.pair_attempts = 0
         self.stop_event = threading.Event()
         self.relay_wakeup = threading.Event()
+        self.camera_stop_event = threading.Event()
+        self.camera_thread = None
+        self.camera_frame_callback = None
+        self.camera_sequence = 0
         self._load_saved_session()
         self.server = None
         self.thread = None
@@ -105,6 +113,7 @@ class DroidLinkBridge:
 
     def close(self):
         self.stop_event.set()
+        self.camera_stop_event.set()
         self.relay_wakeup.set()
         if self.server:
             self.server.shutdown()
@@ -254,6 +263,7 @@ class DroidLinkBridge:
         return code
 
     def cancel_pairing(self):
+        self.stop_camera_receive()
         with self.lock:
             previous = (self.relay_url, self.session_id, self.token) if self.session_id and self.token else None
             self.code = None
@@ -272,6 +282,7 @@ class DroidLinkBridge:
         self._changed()
 
     def disconnect(self):
+        self.stop_camera_receive()
         with self.lock:
             previous = (self.relay_url, self.session_id, self.token) if self.session_id and self.token else None
             self.code = None
@@ -288,6 +299,108 @@ class DroidLinkBridge:
             threading.Thread(target=self._revoke_remote, args=previous, daemon=True).start()
         self.relay_wakeup.set()
         self._changed()
+
+    def start_camera_receive(self, callback):
+        with self.lock:
+            if not self.paired or not self.session_id or not self.token:
+                return False
+            self.camera_frame_callback = callback
+            self.camera_stop_event.clear()
+            if self.camera_thread and self.camera_thread.is_alive():
+                return True
+            self.camera_sequence = 0
+            self.camera_thread = threading.Thread(target=self._camera_frame_loop, daemon=True)
+            self.camera_thread.start()
+        return True
+
+    def stop_camera_receive(self):
+        self.camera_stop_event.set()
+        with self.lock:
+            self.camera_frame_callback = None
+
+    def _camera_frame_loop(self):
+        connection = None
+        connection_origin = None
+        while not self.stop_event.is_set() and not self.camera_stop_event.is_set():
+            with self.lock:
+                session_id, token = self.session_id, self.token
+                relay_url = self.relay_url
+                sequence = self.camera_sequence
+                callback = self.camera_frame_callback
+                paired = self.paired
+            if not paired or not session_id or not token or not callback:
+                self.camera_stop_event.wait(0.5)
+                continue
+            try:
+                parsed = urlsplit(relay_url)
+                if parsed.scheme not in ("https", "http") or not parsed.hostname:
+                    raise ValueError("Adresse du relais invalide")
+                origin = (parsed.scheme, parsed.hostname, parsed.port)
+                if connection is None or connection_origin != origin:
+                    if connection is not None:
+                        connection.close()
+                    if parsed.scheme == "https":
+                        connection = http.client.HTTPSConnection(
+                            parsed.hostname,
+                            parsed.port or 443,
+                            timeout=9,
+                            context=ssl.create_default_context(),
+                        )
+                    else:
+                        connection = http.client.HTTPConnection(
+                            parsed.hostname,
+                            parsed.port or 80,
+                            timeout=9,
+                        )
+                    connection_origin = origin
+                path = (
+                    f"{parsed.path.rstrip('/')}/v1/sessions/{session_id}/camera/frame"
+                    f"?after={sequence}&wait=5"
+                )
+                connection.request(
+                    "GET",
+                    path,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "image/jpeg",
+                        "Connection": "keep-alive",
+                    },
+                )
+                response = connection.getresponse()
+                frame = response.read(MAX_CAMERA_FRAME + 1)
+                if response.status == 204:
+                    continue
+                if response.status != 200:
+                    if response.status in (401, 404):
+                        self.camera_stop_event.wait(1)
+                    else:
+                        self.camera_stop_event.wait(0.3)
+                    continue
+                if not frame or len(frame) > MAX_CAMERA_FRAME:
+                    continue
+                next_sequence = int(response.headers.get("X-Frame-Sequence", "0"))
+                rotation = int(response.headers.get("X-Frame-Rotation", "0"))
+                if next_sequence <= sequence or rotation not in (0, 90, 180, 270):
+                    continue
+                with self.lock:
+                    if self.camera_stop_event.is_set():
+                        break
+                    self.camera_sequence = next_sequence
+                    callback = self.camera_frame_callback
+                if callback:
+                    try:
+                        callback(frame, rotation)
+                    except Exception:
+                        self.camera_stop_event.set()
+                        break
+            except (http.client.HTTPException, OSError, URLError, TimeoutError, ValueError):
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                    connection_origin = None
+                self.camera_stop_event.wait(0.3)
+        if connection is not None:
+            connection.close()
 
     def snapshot(self):
         with self.lock:
@@ -656,6 +769,12 @@ class DroidLinkBridge:
                     "key": str(payload.get("key", ""))[:256],
                     "success": bool(payload.get("success", False)),
                     "message": str(payload.get("message", ""))[:200],
+                }
+            elif event_type == "camera_status":
+                event = {
+                    "type": event_type,
+                    "running": bool(payload.get("running", False)),
+                    "message": str(payload.get("message", ""))[:240],
                 }
             elif event_type == "photo_list":
                 items = []

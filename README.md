@@ -27,8 +27,9 @@ Les captures ci-dessous sont des exemples anonymisés, préparés pour illustrer
 - **Appels dans GNOME** : lancer un appel avec l’application Téléphone Android habituelle, répondre/refuser/raccrocher avec les commandes ADB. Le téléphone garde sa SIM; Bluetooth HFP/HSP transporte la voix entre Android et le PC. L’enregistrement automatique optionnel capture la conversation en Opus quand DroidDesk détecte l’appel et relie HFP; les fichiers vont dans `Musique/DroidDesk Calls`.
 - **Contacts** : lecture par DroidLink avec l’autorisation Android Contacts; ADB reste un mode de repli pendant la migration. **Récents** : journal d’appels encore lu via ADB.
 - **SMS** : lire les conversations et l’historique existants depuis la base SMS Android via ADB; préparer une réponse dans l’application Messages du téléphone.
-- **Écran et apps** : contrôler scrcpy incrusté dans DroidDesk et ouvrir au besoin une fenêtre native scrcpy avec le même téléphone, parcourir les applications avec leurs vraies icônes Android, afficher leurs réglages ou les désinstaller.
-- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; monter le stockage dans Nautilus par ADB Wi-Fi avec madbfs/FUSE; afficher les 2 000 photos récentes et supprimer une photo par DroidLink après confirmation Android (Android 11+).
+- **Écran et apps** : afficher et contrôler scrcpy dans DroidDesk ou ouvrir une fenêtre native scrcpy; parcourir les applications avec leurs vraies icônes Android, afficher leurs réglages ou les désinstaller avec le clic droit.
+- **Fichiers et photos** : parcourir `/sdcard` par ADB, envoyer et télécharger des fichiers; monter le stockage par MTP en USB ou madbfs/FUSE par ADB Wi-Fi; afficher les 2 000 photos récentes avec vignettes puis aperçus haute résolution, et supprimer une photo après confirmation Android.
+- **Webcam du téléphone** : DroidLink transmet la caméra autorisée comme périphérique vidéo `DroidDesk Camera`, sélectionnable dans OBS, Meet et les autres applications GNOME.
 - **Bluetooth** : choisir un contrôleur (USB ou intégré), activer la radio, rechercher, appairer, connecter, renommer et oublier des appareils.
 - **ADB** : appairage sans fil, connexions TCP/IP, redémarrage/récupération/bootloader, touches système, captures d’écran, logcat, propriétés Android et console `adb shell`.
 - **Infos téléphone** : le fabricant, le modèle, Android, la batterie et le stockage partagé restent visibles dans l’en-tête, avec un bouton d’actualisation.
@@ -41,7 +42,7 @@ Les captures ci-dessous sont des exemples anonymisés, préparés pour illustrer
 
 ```sh
 sudo apt update
-sudo apt install bluez adb scrcpy ffmpeg gvfs-backends python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 meson ninja-build
+sudo apt install bluez adb scrcpy ffmpeg v4l2loopback-dkms v4l2loopback-utils gvfs-backends python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 meson ninja-build
 ```
 
 Le montage Nautilus sans fil nécessite également **madbfs** et **FUSE**. Leur nom de paquet dépend de la version de Debian; installe-les depuis les dépôts de ta distribution avant de choisir **Monter dans Nautilus · ADB Wi-Fi**.
@@ -115,6 +116,8 @@ Dans **Écran et apps**, choisir une application l’ouvre sur Android et l’af
 Dans **Fichiers**, **Monter dans Nautilus · ADB Wi-Fi** monte `/sdcard` dans GNOME Files via madbfs et FUSE. La connexion ADB Wi-Fi doit déjà être active. Le montage reste en lecture/écriture selon les droits Android; les dossiers privés des applications demeurent protégés.
 
 Dans **Écran et apps**, la molette envoie le défilement à l’application Android affichée. **Pop-up scrcpy** lance la fenêtre native scrcpy pour le téléphone actuellement connecté.
+
+Pour utiliser le téléphone comme webcam, associe DroidLink, ouvre **Partage** sur Android et démarre le partage de caméra. Dans **Fichiers** sur le PC, clique **Activer la webcam du téléphone**; DroidDesk charge `v4l2loopback` après autorisation système et expose `/dev/video42` sous le nom **DroidDesk Camera**. Choisis cette caméra dans l’application vidéo. Arrête le flux depuis DroidLink ou le bouton DroidDesk. Le flux JPEG transite par le relais HTTPS auto-hébergé; son administrateur peut voir la vidéo en transit. La fonction demande uniquement la permission Android **Caméra**, aucun micro ni accès audio d’appel.
 
 La page **SMS** lit les messages enregistrés dans `content://sms` via la commande ADB `content query`; les messages et numéros ne sont pas transmis au service DroidLink. DroidDesk conserve localement une copie privée des conversations et des derniers fils consultés pour les réafficher immédiatement au prochain démarrage; les fichiers sont limités à l’utilisateur du compte Linux et restent dans le cache `~/.cache/droiddesk/messages/`. Le bouton de réponse ouvre Messages Android avec le destinataire et le texte préremplis afin que l’application habituelle confirme l’envoi. Android protège les permissions SMS des applications tierces; la lecture directe ici utilise le fournisseur accessible à l’utilisateur `shell` d’ADB.
 

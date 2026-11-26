@@ -184,6 +184,7 @@ class NotificationRelayService : NotificationListenerService() {
                     )
                     "ring_phone" -> DroidLinkRinger.ring(this)
                     "stop_phone_ring" -> DroidLinkRinger.stop()
+                    "camera_stop" -> DroidLinkCameraService.stop(this)
                     "contacts_list" -> DroidLinkContacts.send(this, token)
                     "photo_list" -> DroidLinkMedia.sendRecentImages(this, token)
                     "photo_thumbnail" -> command.optLong("photoId", -1L)

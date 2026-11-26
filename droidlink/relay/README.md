@@ -51,13 +51,14 @@ Le relais exige `X-Forwarded-Proto: https` sur les routes de compte; NPM transme
 
 ## Données et disponibilité
 
-SQLite conserve les jetons hachés et les renseignements d'état du téléphone. Le contenu des notifications, photos et commandes est placé en mémoire pour être transféré; il n'est pas enregistré dans la base. Les files en mémoire sont perdues lors d'un redémarrage, mais les associations persistent.
+SQLite conserve les jetons hachés et les renseignements d'état du téléphone. Les notifications, photos, commandes et images webcam transitent uniquement en mémoire; pour la caméra, le relais garde seulement la dernière image JPEG par session. Le relais et son administrateur peuvent voir ces contenus en transit. Les données en mémoire disparaissent au redémarrage, mais les associations persistent.
 
 ## Routes
 
 - `POST /v1/sessions` : enregistrer la session de bureau et son code à usage unique.
 - `POST /v1/pair` : associer DroidLink au code et recevoir le jeton du téléphone.
 - `/v1/sessions/{id}/events` : événements du téléphone vers le bureau.
+- `POST /v1/sessions/{id}/camera/frame` et `GET /v1/sessions/{id}/camera/frame?after=…&wait=…` : dernière image webcam binaire du téléphone vers le bureau; maximum 512 Ko par image.
 - `/v1/sessions/{id}/commands` : commandes du bureau vers le téléphone.
 - `/v1/sessions/{id}/phone` et `/status` : état et renseignements de l'appareil.
 - `POST /v1/sessions/{id}/unpair` : révoquer l'association.

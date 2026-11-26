@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -783,12 +784,22 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.call_audio_should_stop = False
         self.call_audio_record_sources = None
         self.call_session_active = False
+        self.call_dtmf_lock = threading.Lock()
+        self.call_dtmf_queue = []
+        self.call_dtmf_generation = 0
+        self.call_dtmf_worker_running = False
         self.call_direction = "outgoing"
         self.call_peer_label = ""
         self.call_recording_enabled = self._load_call_recording_enabled()
         self.call_recording_process = None
         self.call_recording_path = None
         self.call_recording_issue = ""
+        self.phone_webcam_active = False
+        self.phone_webcam_device = "/dev/video42"
+        self.phone_webcam_process = None
+        self.phone_webcam_frames = 0
+        self.phone_webcam_generation = 0
+        self.phone_webcam_lock = threading.Lock()
         self.photo_preview_dir = None
         self.photo_preview_window = None
         self.external_photo_dirs = []
@@ -1770,6 +1781,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
         outgoing = Adw.PreferencesGroup.new()
         outgoing.set_title("Composer")
+        self.call_composer_group = outgoing
         outgoing.add_css_class("call-panel")
         outgoing.set_size_request(310, -1)
         self.call_contact_search = Gtk.SearchEntry()
@@ -1810,12 +1822,21 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         number_controls.append(delete_digit_button)
         outgoing.add(number_controls)
 
+        self.call_dtmf_hint = Gtk.Label(
+            label="En appel, les touches sont envoyées au clavier du téléphone Android.", xalign=0
+        )
+        self.call_dtmf_hint.add_css_class("dim-label")
+        self.call_dtmf_hint.set_wrap(True)
+        self.call_dtmf_hint.set_visible(False)
+        outgoing.add(self.call_dtmf_hint)
+
         self.dialpad = Gtk.Grid()
         self.dialpad.add_css_class("call-keypad")
         self.dialpad.set_row_spacing(7)
         self.dialpad.set_column_spacing(7)
         self.dialpad.set_halign(Gtk.Align.CENTER)
         self.dialpad.set_margin_top(4)
+        self.dialpad_buttons = []
         dial_keys = (
             ("1", ""), ("2", "ABC"), ("3", "DEF"),
             ("4", "GHI"), ("5", "JKL"), ("6", "MNO"),
@@ -1836,6 +1857,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             key.set_child(key_box)
             key.set_tooltip_text(f"Composer {digit}")
             key.connect("clicked", lambda _button, value=digit: self._append_digit(value))
+            self.dialpad_buttons.append((digit, key))
             self.dialpad.attach(key, index % 3, index // 3, 1, 1)
         outgoing.add(self.dialpad)
         self.dial_button = Gtk.Button(label="Appeler depuis GNOME")
@@ -2276,6 +2298,30 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         share_link.add(link_controls)
         page.append(share_link)
 
+        camera_group = Adw.PreferencesGroup.new()
+        camera_group.set_title("Partager la caméra comme webcam")
+        camera_group.set_description(
+            "Active la caméra dans DroidLink sur le téléphone, puis expose son flux comme périphérique vidéo GNOME."
+        )
+        self.phone_webcam_status = Gtk.Label(
+            label="DroidLink → Partage → Démarrer le partage. La vidéo passe par le relais HTTPS associé.",
+            xalign=0,
+        )
+        self.phone_webcam_status.set_wrap(True)
+        self.phone_webcam_status.add_css_class("dim-label")
+        camera_group.add(self.phone_webcam_status)
+        camera_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.phone_webcam_start_button = Gtk.Button(label="Activer la webcam du téléphone")
+        self.phone_webcam_start_button.add_css_class("suggested-action")
+        self.phone_webcam_start_button.connect("clicked", self._start_phone_webcam)
+        camera_actions.append(self.phone_webcam_start_button)
+        self.phone_webcam_stop_button = Gtk.Button(label="Arrêter")
+        self.phone_webcam_stop_button.set_sensitive(False)
+        self.phone_webcam_stop_button.connect("clicked", self._stop_phone_webcam)
+        camera_actions.append(self.phone_webcam_stop_button)
+        camera_group.add(camera_actions)
+        page.append(camera_group)
+
         self.files_note = Gtk.Label(
             label="Nautilus monte /sdcard par ADB Wi-Fi avec madbfs et FUSE. Les dossiers privés des applications restent protégés par Android.",
             xalign=0,
@@ -2284,6 +2330,199 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.files_note.add_css_class("dim-label")
         page.append(self.files_note)
         return page
+
+    def _start_phone_webcam(self, *_args):
+        bridge = getattr(self, "droidlink_bridge", None)
+        if not bridge or not bridge.snapshot().get("paired"):
+            self.phone_webcam_status.set_text("Associe DroidLink à DroidDesk avant d’activer la webcam.")
+            return
+        if self.phone_webcam_active:
+            return
+        if not shutil.which("ffmpeg"):
+            self.phone_webcam_status.set_text("Installe ffmpeg et v4l2loopback-dkms pour créer la webcam GNOME.")
+            return
+        self.phone_webcam_active = True
+        self.phone_webcam_frames = 0
+        self.phone_webcam_generation += 1
+        generation = self.phone_webcam_generation
+        self.phone_webcam_start_button.set_sensitive(False)
+        self.phone_webcam_stop_button.set_sensitive(True)
+        self.phone_webcam_status.set_text(
+            "Préparation de DroidDesk Camera. Si demandé, autorise le chargement du périphérique vidéo."
+        )
+        threading.Thread(
+            target=self._prepare_phone_webcam,
+            args=(generation,),
+            daemon=True,
+        ).start()
+
+    def _prepare_phone_webcam(self, generation):
+        device = Path(self.phone_webcam_device)
+        if not device.exists():
+            pkexec = shutil.which("pkexec")
+            modprobe = shutil.which("modprobe")
+            if not pkexec or not modprobe:
+                GLib.idle_add(
+                    self._phone_webcam_failed,
+                    generation,
+                    "Installe v4l2loopback-dkms et pkexec pour créer la webcam système.",
+                )
+                return
+            try:
+                result = subprocess.run(
+                    [
+                        pkexec, modprobe, "v4l2loopback", "devices=1", "video_nr=42",
+                        "card_label=DroidDesk_Camera", "exclusive_caps=1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                GLib.idle_add(self._phone_webcam_failed, generation, str(error))
+                return
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                GLib.idle_add(
+                    self._phone_webcam_failed,
+                    generation,
+                    detail or "Impossible de charger v4l2loopback. Installe le module compatible avec ton noyau.",
+                )
+                return
+        if not device.exists():
+            GLib.idle_add(
+                self._phone_webcam_failed,
+                generation,
+                f"Le périphérique {device} n’est pas apparu après le chargement de v4l2loopback.",
+            )
+            return
+        if not os.access(device, os.W_OK):
+            GLib.idle_add(
+                self._phone_webcam_failed,
+                generation,
+                f"Accès refusé à {device}. Ajoute ton compte au groupe video puis reconnecte ta session.",
+            )
+            return
+        if generation != self.phone_webcam_generation or not self.phone_webcam_active:
+            return
+        bridge = getattr(self, "droidlink_bridge", None)
+        if not bridge or not bridge.start_camera_receive(self._phone_webcam_received):
+            GLib.idle_add(self._phone_webcam_failed, generation, "La connexion DroidLink n’est plus associée.")
+            return
+        GLib.idle_add(
+            self._set_phone_webcam_waiting,
+            generation,
+            "En attente des images du téléphone. Dans DroidLink → Partage, démarre la caméra.",
+        )
+
+    def _set_phone_webcam_waiting(self, generation, message):
+        if generation == self.phone_webcam_generation and self.phone_webcam_active:
+            self.phone_webcam_status.set_text(message)
+        return GLib.SOURCE_REMOVE
+
+    def _phone_webcam_received(self, jpeg, rotation):
+        try:
+            self._write_phone_webcam_frame(jpeg, rotation)
+        except Exception as error:
+            GLib.idle_add(
+                self._phone_webcam_failed,
+                self.phone_webcam_generation,
+                str(error) or "Le flux vidéo s’est interrompu.",
+            )
+
+    def _write_phone_webcam_frame(self, jpeg, rotation):
+        with self.phone_webcam_lock:
+            if not self.phone_webcam_active:
+                return
+            process = self.phone_webcam_process
+            if process and process.poll() is not None:
+                self.phone_webcam_process = None
+                process = None
+            if process is None:
+                ffmpeg = shutil.which("ffmpeg")
+                if not ffmpeg:
+                    raise RuntimeError("ffmpeg est introuvable.")
+                filters = []
+                if rotation == 90:
+                    filters.append("transpose=clock")
+                elif rotation == 270:
+                    filters.append("transpose=cclock")
+                elif rotation == 180:
+                    filters.extend(("hflip", "vflip"))
+                filters.extend((
+                    "scale=640:480:force_original_aspect_ratio=decrease",
+                    "pad=640:480:(ow-iw)/2:(oh-ih)/2",
+                    "format=yuyv422",
+                ))
+                command = [
+                    ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-f", "image2pipe", "-framerate", "10", "-vcodec", "mjpeg", "-i", "pipe:0",
+                    "-vf", ",".join(filters), "-r", "10", "-pix_fmt", "yuyv422",
+                    "-f", "v4l2", self.phone_webcam_device,
+                ]
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                self.phone_webcam_process = process
+            try:
+                if not process.stdin:
+                    raise BrokenPipeError("Le flux d’entrée FFmpeg est fermé.")
+                process.stdin.write(jpeg)
+                self.phone_webcam_frames += 1
+                first_frame = self.phone_webcam_frames == 1
+            except (BrokenPipeError, OSError) as error:
+                raise RuntimeError(f"FFmpeg a perdu la webcam virtuelle : {error}") from error
+        if first_frame:
+            GLib.idle_add(
+                self._set_phone_webcam_waiting,
+                self.phone_webcam_generation,
+                f"Webcam active · DroidDesk Camera · {self.phone_webcam_device}",
+            )
+
+    def _phone_webcam_failed(self, generation, message):
+        if generation != self.phone_webcam_generation:
+            return GLib.SOURCE_REMOVE
+        self.phone_webcam_active = False
+        bridge = getattr(self, "droidlink_bridge", None)
+        if bridge:
+            bridge.stop_camera_receive()
+        process = self.phone_webcam_process
+        self.phone_webcam_process = None
+        if process and process.poll() is None:
+            process.terminate()
+        self.phone_webcam_start_button.set_sensitive(True)
+        self.phone_webcam_stop_button.set_sensitive(False)
+        self.phone_webcam_status.set_text(f"Webcam indisponible · {message}")
+        self._set_status(f"Webcam du téléphone impossible : {message}", True)
+        return GLib.SOURCE_REMOVE
+
+    def _stop_phone_webcam(self, *_args, send_remote=True):
+        if not getattr(self, "phone_webcam_active", False):
+            return
+        self.phone_webcam_active = False
+        self.phone_webcam_generation += 1
+        bridge = getattr(self, "droidlink_bridge", None)
+        if bridge:
+            bridge.stop_camera_receive()
+            if send_remote and bridge.snapshot().get("paired"):
+                bridge.enqueue_command("camera_stop", "")
+        with self.phone_webcam_lock:
+            process = self.phone_webcam_process
+            self.phone_webcam_process = None
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        if hasattr(self, "phone_webcam_start_button"):
+            self.phone_webcam_start_button.set_sensitive(True)
+            self.phone_webcam_stop_button.set_sensitive(False)
+            self.phone_webcam_status.set_text("Webcam arrêtée. Le partage Android peut aussi être arrêté dans DroidLink.")
 
     def update_bluetooth_view(self):
         if not hasattr(self, "bluez"):
@@ -2952,6 +3191,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.bluez.call(self.selected_adapter, "org.bluez.Adapter1", method, callback=lambda _reply, error: self._set_status(f"Recherche Bluetooth impossible : {_error_text(error)}" if error else ("Recherche arrêtée" if method == "StopDiscovery" else "Recherche Bluetooth démarrée"), bool(error)))
 
     def _on_close(self, *_args):
+        self._stop_phone_webcam(send_remote=False)
         if getattr(self, "gallery_prefetch_timer", 0):
             GLib.source_remove(self.gallery_prefetch_timer)
             self.gallery_prefetch_timer = 0
@@ -3128,6 +3368,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
             self.droidlink_relay_log_box.append(row)
 
     def _droidlink_received(self, event):
+        if event.get("type") == "camera_status":
+            message = str(event.get("message") or "")[:240]
+            if hasattr(self, "phone_webcam_status") and not self.phone_webcam_active:
+                self.phone_webcam_status.set_text(
+                    f"Téléphone : {message or ('caméra active' if event.get('running') else 'caméra arrêtée')}"
+                )
+            return GLib.SOURCE_REMOVE
         if event.get("type") == "contacts_list":
             contacts = []
             for item in event.get("items", []):
@@ -4043,10 +4290,28 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         self.reject_call_button.set_visible(incoming_call)
         self.call_controls_group.set_visible(incoming_call)
         composer_ready = ready and not self.call_session_active and not incoming_call
+        self.call_composer_group.set_title(
+            "Clavier de l’appel" if self.call_session_active else "Composer"
+        )
+        self.call_contact_search.set_visible(not self.call_session_active)
+        if self.call_session_active:
+            self.call_contact_matches.set_visible(False)
+        else:
+            self.call_contact_matches.set_visible(
+                self.call_contact_matches.get_first_child() is not None
+                and len(self.call_contact_search.get_text().strip()) >= 2
+            )
+        self.call_number_controls.set_visible(not self.call_session_active)
+        self.call_dtmf_hint.set_visible(self.call_session_active)
         self.call_contact_search.set_sensitive(composer_ready)
         self.call_contact_matches.set_sensitive(composer_ready)
         self.call_number_controls.set_sensitive(composer_ready)
-        self.dialpad.set_sensitive(composer_ready)
+        self.dialpad.set_sensitive(ready and (self.call_session_active or not incoming_call))
+        for digit, button in self.dialpad_buttons:
+            button.set_tooltip_text(
+                f"Envoyer la tonalité {digit} pendant l’appel"
+                if self.call_session_active else f"Composer {digit}"
+            )
         for button in self.recent_call_buttons:
             button.set_sensitive(ready and not self.call_session_active and not incoming_call)
         for filter_button in self.recents_filter_buttons.values():
@@ -4774,9 +5039,175 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _append_digit(self, digit):
+        if self.call_session_active:
+            self._send_dtmf_digit(digit)
+            return
         self.number_entry.set_text(self.number_entry.get_text() + digit)
         self.number_entry.set_position(-1)
         self.number_entry.grab_focus()
+
+    def _reset_call_dtmf_state(self):
+        with self.call_dtmf_lock:
+            self.call_dtmf_generation += 1
+            self.call_dtmf_queue.clear()
+
+    def _send_dtmf_digit(self, digit):
+        if digit not in "0123456789*#" or not self.call_session_active:
+            return
+        active = self._active_device()
+        if not active:
+            self._set_status("Reconnecte le téléphone ADB pour envoyer les touches d’appel.", True)
+            return
+        start_worker = False
+        with self.call_dtmf_lock:
+            self.call_dtmf_queue.append((active[0], self.call_dtmf_generation, digit))
+            if not self.call_dtmf_worker_running:
+                self.call_dtmf_worker_running = True
+                start_worker = True
+        self._set_status(f"Envoi de la tonalité {digit} à l’appel…")
+        if start_worker:
+            threading.Thread(target=self._send_dtmf_queue_worker, daemon=True).start()
+
+    def _send_dtmf_queue_worker(self):
+        last_digit = ""
+        error = ""
+        while True:
+            with self.call_dtmf_lock:
+                if not self.call_dtmf_queue:
+                    self.call_dtmf_worker_running = False
+                    break
+                serial, generation, digit = self.call_dtmf_queue.pop(0)
+                if generation != self.call_dtmf_generation:
+                    continue
+            try:
+                self._send_one_dtmf_digit(serial, digit)
+                last_digit = digit
+            except (OSError, subprocess.SubprocessError, RuntimeError, ET.ParseError) as exc:
+                error = str(exc)
+                with self.call_dtmf_lock:
+                    self.call_dtmf_queue = [
+                        item for item in self.call_dtmf_queue
+                        if item[1] != generation
+                    ]
+                    self.call_dtmf_worker_running = False
+                break
+        if last_digit or error:
+            GLib.idle_add(self._call_dtmf_result, last_digit, error)
+
+    def _send_one_dtmf_digit(self, serial, digit):
+        def run(*args, timeout=8):
+            result = subprocess.run(
+                [self.adb, "-s", serial, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "ADB a échoué.").strip())
+            return result.stdout or ""
+
+        state = run("shell", "dumpsys", "telephony.registry")
+        if not re.search(r"\bmCallState\s*=\s*2\b", state):
+            raise RuntimeError("Android ne détecte pas d’appel cellulaire actif.")
+        run("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+        time.sleep(0.25)
+        activities = run("shell", "dumpsys", "activity", "activities")
+        top_activity = next(
+            (line.casefold() for line in activities.splitlines() if "topResumedActivity=" in line),
+            "",
+        )
+        if not any(name in top_activity for name in (
+            "incallui", "com.android.dialer", "com.google.android.dialer", "com.android.phone"
+        )):
+            raise RuntimeError(
+                "Affiche l’écran de l’appel sur le téléphone pour envoyer les touches du clavier."
+            )
+
+        hierarchy_path = "/sdcard/droiddesk-in-call.xml"
+
+        def dump_hierarchy():
+            run("shell", "uiautomator", "dump", hierarchy_path)
+            markup = run("shell", "cat", hierarchy_path)
+            root = ET.fromstring(markup)
+            packages = {
+                node.attrib.get("package", "").casefold()
+                for node in root.iter("node")
+            }
+            if not any(
+                "incallui" in package or "dialer" in package or package == "com.android.phone"
+                for package in packages
+            ):
+                raise RuntimeError(
+                    "Android n’affiche pas le clavier d’appel. Affiche l’appel puis réessaie."
+                )
+            return root
+
+        root = dump_hierarchy()
+        parents = {child: parent for parent in root.iter() for child in parent}
+
+        def click_point(node):
+            current = node
+            fallback = None
+            while current is not None:
+                match = re.search(
+                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                    current.attrib.get("bounds", ""),
+                )
+                if match:
+                    x1, y1, x2, y2 = (int(value) for value in match.groups())
+                    point = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    if fallback is None:
+                        fallback = point
+                    if current.attrib.get("clickable") == "true":
+                        return point
+                current = parents.get(current)
+            return fallback
+
+        def keypad_points(tree):
+            points = {}
+            for node in tree.iter("node"):
+                labels = (
+                    node.attrib.get("text", ""), node.attrib.get("content-desc", "")
+                )
+                for label in labels:
+                    label = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", label).strip()
+                    match = re.match(r"^([0-9*#])(?:$|[\s,])", label)
+                    if match:
+                        point = click_point(node)
+                        if point:
+                            points.setdefault(match.group(1), point)
+            return points
+
+        points = keypad_points(root)
+        if not all(key in points for key in "12345"):
+            toggle = None
+            for node in root.iter("node"):
+                label = " ".join((
+                    node.attrib.get("text", ""), node.attrib.get("content-desc", "")
+                )).casefold()
+                if any(term in label for term in ("clavier", "keypad", "dialpad")):
+                    toggle = click_point(node)
+                    if toggle:
+                        break
+            if not toggle:
+                raise RuntimeError("Le bouton « Clavier » de l’appel est introuvable sur Android.")
+            run("shell", "input", "tap", str(toggle[0]), str(toggle[1]))
+            time.sleep(0.4)
+            root = dump_hierarchy()
+            parents = {child: parent for parent in root.iter() for child in parent}
+            points = keypad_points(root)
+        if digit not in points:
+            raise RuntimeError(f"La touche {digit} n’est pas visible dans le clavier Android.")
+        point = points[digit]
+        run("shell", "input", "tap", str(point[0]), str(point[1]))
+
+    def _call_dtmf_result(self, digit, error):
+        if error:
+            self._set_status(f"Tonalité non envoyée : {error}", True)
+        elif digit:
+            self._set_status(f"Tonalité {digit} envoyée à l’appel.")
+        return GLib.SOURCE_REMOVE
 
     def _clear_call_number(self, *_args):
         self.number_entry.set_text("")
@@ -6268,6 +6699,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
 
     def _finish_call_session(self):
         self.call_session_active = False
+        self._reset_call_dtmf_state()
         self.call_peer_label = ""
         self.call_audio_should_stop = True
         self.call_audio_auto_retries = 0
@@ -6515,6 +6947,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _schedule_call_audio_bridge(self):
+        self._reset_call_dtmf_state()
         self.call_audio_auto_retries = 10
         self.call_audio_should_stop = False
         self.call_recording_issue = ""
@@ -6674,7 +7107,10 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 for profile_name, profile in profiles.items():
                     key = profile_name.casefold().replace("_", "-")
                     is_hfp = any(token in key for token in (
-                        "headset-head-unit", "handsfree-head-unit", "hfp-hf", "hsp-hs"
+                        "headset-head-unit", "handsfree-head-unit", "hfp-hf", "hsp-hs",
+                        # PipeWire names a phone's Hands-Free Audio Gateway profile
+                        # "audio-gateway"; it is the normal phone-side HFP profile.
+                        "audio-gateway",
                     ))
                     available = profile.get("available") if isinstance(profile, dict) else None
                     if is_hfp and available not in ("no", False):
@@ -6682,7 +7118,7 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 priority = (
                     "headset-head-unit-msbc", "headset-head-unit",
                     "headset-head-unit-cvsd", "handsfree-head-unit",
-                    "hfp-hf", "hsp-hs",
+                    "hfp-hf", "audio-gateway", "hsp-hs",
                 )
                 names.sort(key=lambda name: next(
                     (index for index, value in enumerate(priority) if value in name.casefold().replace("_", "-")),
@@ -6794,13 +7230,13 @@ class DroidDeskWindow(Adw.ApplicationWindow):
                 receive_id = run(
                     "load-module", "module-loopback",
                     f"source={phone_source_name}", f"sink={output_name}",
-                    "latency_msec=80", "source_dont_move=true", "sink_dont_move=true",
+                    "latency_msec=200", "source_dont_move=true", "sink_dont_move=true",
                 )
                 module_ids.append(receive_id)
                 transmit_id = run(
                     "load-module", "module-loopback",
                     f"source={mic_name}", f"sink={phone_sinks[0]['name']}",
-                    "latency_msec=80", "source_dont_move=true", "sink_dont_move=true",
+                    "latency_msec=200", "source_dont_move=true", "sink_dont_move=true",
                 )
                 module_ids.append(transmit_id)
             except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError, TypeError, KeyError) as exc:

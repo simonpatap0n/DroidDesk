@@ -17,6 +17,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.1" date="2026-11-26">
+      <description>
+        <p>Ajoute le partage de la caméra Android comme webcam GNOME via DroidLink et le relais HTTPS. La capture JPEG Android remplace la conversion YUV logicielle afin de corriger les artefacts de couleur et de réduire la charge du téléphone.</p>
+        <p>Réutilise les connexions persistantes au relais et corrige l’état de partage qui pouvait rester affiché comme actif après une mise à jour.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-25">
       <description>
         <p>Ajoute le choix du domaine HTTPS privé pour DroidLink sur le bureau et Android, et documente le déploiement du relais avec Docker Compose et Nginx Proxy Manager.</p>
